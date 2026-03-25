@@ -1,6 +1,6 @@
-"""RAG pipeline (ingestion → embeddings → retrieval → generation) with vector or Neo4j backends."""
+"""RAG pipeline with dual vector (Chroma) + graph (Neo4j) backend support."""
 
-from rag_brain.config import RetrievalBackend
+from rag_brain.config import ChunkingStrategy, RetrievalBackend
 from rag_brain.pipeline import RAGPipeline
 
-__all__ = ["RAGPipeline", "RetrievalBackend"]
+__all__ = ["RAGPipeline", "RetrievalBackend", "ChunkingStrategy"]
