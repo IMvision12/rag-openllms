@@ -4,6 +4,8 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 
 class RetrievalBackend(str, Enum):
     vector = "vector"
@@ -18,7 +20,7 @@ class ChunkingStrategy(str, Enum):
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_PROJECT_ROOT / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
         populate_by_name=True,
@@ -33,7 +35,7 @@ class Settings(BaseSettings):
 
     # --- Chroma (vector) ---
     chroma_persist_dir: Path = Field(
-        default=Path("./data/chroma_db"),
+        default=_PROJECT_ROOT / "data" / "chroma_db",
         alias="CHROMA_PERSIST_DIR",
     )
     chroma_collection: str = Field(default="rag_docs", alias="CHROMA_COLLECTION")

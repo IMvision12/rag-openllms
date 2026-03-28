@@ -5,6 +5,7 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from rag_brain.config import ChunkingStrategy, Settings
+from rag_brain.embeddings import get_embeddings
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx"}
 
@@ -59,12 +60,13 @@ def _fixed_split(documents: list[Document], settings: Settings) -> list[Document
 
 
 def _semantic_split(documents: list[Document], settings: Settings) -> list[Document]:
-    """Sentence-boundary aware splitting: split on sentences first, then merge up to chunk_size."""
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=settings.chunk_size,
-        chunk_overlap=settings.chunk_overlap,
-        separators=["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""],
-        add_start_index=True,
+    """Embedding-based semantic splitting: groups sentences by similarity."""
+    from langchain_experimental.text_splitter import SemanticChunker
+
+    embeddings = get_embeddings(settings)
+    splitter = SemanticChunker(
+        embeddings=embeddings,
+        breakpoint_threshold_type="percentile",
     )
     return splitter.split_documents(documents)
 

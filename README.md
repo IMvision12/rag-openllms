@@ -8,7 +8,7 @@ Built as a master's project for CPSC 597 at California State University, Fullert
 
 - **Dual backend support** — Chroma (vector DB) + Neo4j (graph DB), usable individually or simultaneously via hybrid retrieval
 - **Multi-format ingestion** — PDF and DOCX documents with metadata preservation
-- **Multiple chunking strategies** — fixed-size or semantic (sentence-boundary aware)
+- **Multiple chunking strategies** — fixed-size or embedding-based semantic (via `SemanticChunker`)
 - **Hybrid retrieval** — queries both backends, deduplicates overlapping chunks, returns top-k results
 - **Source attribution** — LLM answers cite chunk numbers for traceability
 - **Open-source LLMs only** — local inference via Ollama (Llama 3, Mistral, etc.) or HuggingFace Transformers (Qwen, Gemma, Falcon, etc.) with optional 4-bit/8-bit quantization
@@ -21,8 +21,8 @@ Built as a master's project for CPSC 597 at California State University, Fullert
 Document (PDF/DOCX)
     │
     ▼
-Document Loader ──► Text Chunking ──► Embedding Generation
-                    (fixed/semantic)   (sentence-transformers)
+Document Loader ──► Text Chunking ───────────► Embedding Generation
+                    (fixed/SemanticChunker)    (sentence-transformers)
                                             │
                         ┌───────────────────┼───────────────────┐
                         ▼                                       ▼
@@ -66,40 +66,68 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Ingest documents
-
-Hybrid (both backends):
+### Chroma (vector) backend
 
 ```bash
-python -m rag_brain --backend both --ingest "path/to/document.pdf"
-```
-
-With semantic chunking:
-
-```bash
-python -m rag_brain --backend both --ingest "report.docx" --chunking semantic
-```
-
-Single backend:
-
-```bash
+# Ingest a PDF
 python -m rag_brain --backend vector --ingest "document.pdf"
-python -m rag_brain --backend neo4j --ingest "document.pdf"
-```
 
-Add to an existing Chroma collection instead of rebuilding:
+# Ingest a DOCX
+python -m rag_brain --backend vector --ingest "report.docx"
 
-```bash
+# Ingest with semantic chunking
+python -m rag_brain --backend vector --ingest "document.pdf" --chunking semantic
+
+# Append to existing collection instead of rebuilding
 python -m rag_brain --backend vector --ingest "document.pdf" --no-recreate
+
+# Query
+python -m rag_brain --backend vector --query "What are the key findings?"
+
+# Query with retrieved chunks visible
+python -m rag_brain --backend vector --query "What are the key findings?" --show-chunks
 ```
 
-### Query
+### Neo4j (graph) backend
 
 ```bash
-python -m rag_brain --backend both --query "What are the key findings?"
+# Ingest a PDF
+python -m rag_brain --backend neo4j --ingest "document.pdf"
+
+# Ingest a DOCX
+python -m rag_brain --backend neo4j --ingest "report.docx"
+
+# Ingest with semantic chunking
+python -m rag_brain --backend neo4j --ingest "document.pdf" --chunking semantic
+
+# Append to existing index instead of rebuilding
+python -m rag_brain --backend neo4j --ingest "document.pdf" --no-recreate
+
+# Query
+python -m rag_brain --backend neo4j --query "What are the key findings?"
+
+# Query with retrieved chunks visible
+python -m rag_brain --backend neo4j --query "What are the key findings?" --show-chunks
 ```
 
-The CLI prints the answer with source citations, plus a JSON dump of retrieved chunks.
+### Hybrid (both backends)
+
+```bash
+# Ingest into Chroma + Neo4j simultaneously
+python -m rag_brain --backend both --ingest "document.pdf"
+
+# Ingest with semantic chunking
+python -m rag_brain --backend both --ingest "report.docx" --chunking semantic
+
+# Append to both stores
+python -m rag_brain --backend both --ingest "document.pdf" --no-recreate
+
+# Query (retrieves from both, deduplicates, returns top-k)
+python -m rag_brain --backend both --query "What are the key findings?"
+
+# Query with retrieved chunks visible
+python -m rag_brain --backend both --query "What are the key findings?" --show-chunks
+```
 
 ### Evaluate
 
@@ -129,7 +157,8 @@ Options:
   --ingest PATH                   Path to PDF or DOCX file to ingest
   --query TEXT                    Question to ask
   --chunking {fixed,semantic}     Chunking strategy (default: fixed)
-  --no-recreate                   Add to existing Chroma collection
+  --no-recreate                   Add to existing collection instead of rebuilding
+  --show-chunks                   Print retrieved chunks as JSON after the answer
 ```
 
 ## Configuration
@@ -165,7 +194,7 @@ rag-openllms/
 ├── .env                        # Configuration
 ├── requirements.txt            # Dependencies
 ├── rag_brain/
-│   ├── __init__.py             # Package exports
+│   ├── __init__.py             # Package exports + HF noise suppression
 │   ├── __main__.py             # CLI entry point
 │   ├── config.py               # Settings (Pydantic) + enums
 │   ├── ingestion.py            # PDF/DOCX loading + chunking strategies
@@ -176,12 +205,11 @@ rag-openllms/
 
 ## Tech Stack
 
-- **LangChain** — orchestration framework
+- **LangChain + LangChain Experimental** — orchestration framework + `SemanticChunker`
 - **ChromaDB** — local vector database
 - **Neo4j** — graph database with vector index
 - **Sentence Transformers** — embedding models (MiniLM, MPNet, BGE)
 - **Ollama** — local LLM inference (Llama 3, Mistral, etc.)
-- **HuggingFace Transformers** — direct model loading (Qwen, Gemma, Falcon, etc.) with 4-bit/8-bit quantization
-- **Sentence Transformers** — embedding models (MiniLM, MPNet, BGE)
+- **HuggingFace Transformers** — direct model loading (Qwen, Gemma, Falcon, etc.) with 4-bit/8-bit quantization via `ChatHuggingFace`
 - **PyPDF / python-docx** — document processing
 - **ROUGE-score / BERTScore** — evaluation metrics

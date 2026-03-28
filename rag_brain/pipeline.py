@@ -51,9 +51,9 @@ def _deduplicate_docs(docs: list[Document]) -> list[Document]:
 
 
 def _build_hf_llm(settings: Settings):
-    """Build a HuggingFace transformers pipeline wrapped for LangChain."""
+    """Build a HuggingFace transformers pipeline wrapped as a chat model for LangChain."""
     import torch
-    from langchain_huggingface import HuggingFacePipeline
+    from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
     from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
     model_kwargs: dict[str, Any] = {
@@ -82,7 +82,8 @@ def _build_hf_llm(settings: Settings):
         temperature=0.1,
         do_sample=True,
     )
-    return HuggingFacePipeline(pipeline=pipe)
+    llm = HuggingFacePipeline(pipeline=pipe)
+    return ChatHuggingFace(llm=llm)
 
 
 def _build_llm(settings: Settings):
@@ -112,7 +113,12 @@ class RAGPipeline:
         self._chroma_store: Chroma | None = None
         self._neo4j_store: Neo4jVector | None = None
         self._neo4j_graph: Neo4jGraph | None = None
-        self._llm = _build_llm(self.settings)
+        self._llm = None
+
+    def _ensure_llm(self):
+        if self._llm is None:
+            self._llm = _build_llm(self.settings)
+        return self._llm
 
     @property
     def _use_chroma(self) -> bool:
@@ -133,7 +139,7 @@ class RAGPipeline:
             self._ingest_chroma(chunks, recreate=recreate)
 
         if self._use_neo4j:
-            self._ingest_neo4j(chunks)
+            self._ingest_neo4j(chunks, recreate=recreate)
 
         return len(chunks)
 
@@ -158,18 +164,22 @@ class RAGPipeline:
             store.add_documents(chunks)
             self._chroma_store = store
 
-    def _ingest_neo4j(self, chunks: list[Document]) -> None:
+    def _ingest_neo4j(self, chunks: list[Document], *, recreate: bool) -> None:
         if not self.settings.neo4j_password:
             raise ValueError("NEO4J_PASSWORD is required for neo4j backend.")
-        self._neo4j_graph = Neo4jGraph(
-            **_neo4j_conn_kwargs(self.settings), refresh_schema=False
-        )
-        self._neo4j_store = Neo4jVector.from_documents(
-            chunks,
-            self._embeddings,
-            index_name=self.settings.neo4j_vector_index,
-            **_neo4j_conn_kwargs(self.settings),
-        )
+        conn = _neo4j_conn_kwargs(self.settings)
+        self._neo4j_graph = Neo4jGraph(**conn, refresh_schema=False)
+        if recreate:
+            self._neo4j_store = Neo4jVector.from_documents(
+                chunks,
+                self._embeddings,
+                index_name=self.settings.neo4j_vector_index,
+                **conn,
+            )
+        else:
+            store = self._ensure_neo4j()
+            store.add_documents(chunks)
+            self._neo4j_store = store
 
     # ── Loading existing stores ────────────────────────────────────────
 
@@ -223,6 +233,9 @@ class RAGPipeline:
     def query(self, question: str) -> dict[str, Any]:
         """Run retrieval + generation. Returns answer and retrieved chunks."""
         docs = self._retrieve(question)
+        if not docs:
+            import sys
+            print("Warning: no documents retrieved. Did you ingest files first?", file=sys.stderr)
         context = _format_context(docs)
 
         prompt = ChatPromptTemplate.from_messages(
@@ -232,7 +245,7 @@ class RAGPipeline:
             ]
         )
 
-        answer = (prompt | self._llm | StrOutputParser()).invoke(
+        answer = (prompt | self._ensure_llm() | StrOutputParser()).invoke(
             {"context": context, "question": question}
         )
         return {
@@ -286,6 +299,11 @@ def run_cli() -> None:
         default=os.environ.get("CHUNKING_STRATEGY", "fixed"),
         help="Chunking strategy: fixed-size or semantic (sentence-boundary aware).",
     )
+    parser.add_argument(
+        "--show-chunks",
+        action="store_true",
+        help="Print retrieved chunks as JSON after the answer.",
+    )
     args = parser.parse_args()
 
     os.environ["RAG_BACKEND"] = args.backend
@@ -299,8 +317,9 @@ def run_cli() -> None:
     if args.query:
         out = pipe.query(args.query)
         print(out["answer"])
-        print("\n--- retrieved chunks ---")
-        print(json.dumps(out["retrieved"], indent=2, ensure_ascii=False))
+        if args.show_chunks:
+            print("\n--- retrieved chunks ---")
+            print(json.dumps(out["retrieved"], indent=2, ensure_ascii=False))
     elif not args.ingest:
         parser.print_help()
 
