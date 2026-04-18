@@ -66,6 +66,18 @@ pip install -r requirements.txt
 
 ## Usage
 
+### Streamlit UI (recommended)
+
+A 4-step wizard: **Configuration → Models → Documents → Chat**. Select backends and chunking, pick and download embedding + LLM models (with a live progress bar), ingest PDFs/DOCX, then chat with citations.
+
+```bash
+streamlit run app.py
+```
+
+Opens at `http://localhost:8501`. The pipeline auto-initializes when you first ingest or send a message — no separate init step.
+
+### CLI
+
 ### Chroma (vector) backend
 
 ```bash
@@ -192,6 +204,8 @@ All settings are read from `.env` in the project root:
 ```
 rag-openllms/
 ├── .env                        # Configuration
+├── .streamlit/config.toml      # Streamlit theme
+├── app.py                      # Streamlit UI (4-step wizard)
 ├── requirements.txt            # Dependencies
 ├── rag_brain/
 │   ├── __init__.py             # Package exports + HF noise suppression

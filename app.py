@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -43,6 +44,32 @@ EMBEDDING_PRESETS = [
     "intfloat/e5-base-v2",
     "Custom…",
 ]
+
+# Canonical defaults. _hard_reset_session restores these explicitly so the
+# header chips and widgets both render fresh values without having to rely
+# on Streamlit's internal widget cache being cleared by session_state wipe.
+#
+# Keys set to None are *user choices* with no hardcoded default — the UI
+# renders them with no pre-selection and requires the user to pick before
+# Next/Ingest/Chat is enabled. Only environment-neutral knobs (chunking,
+# chunk size, top-k, quantization, max tokens, embedding preset) keep a
+# baked-in default.
+_DEFAULT_CFG: dict = {
+    "cfg_backend": None,          # user picks: vector | both | neo4j
+    "cfg_chunking": "fixed",
+    "cfg_top_k": 4,
+    "cfg_chunk_size": 1200,
+    "cfg_chunk_overlap": 200,
+    "cfg_emb_sel": EMBEDDING_PRESETS[0],
+    "cfg_emb_custom": EMBEDDING_PRESETS[0],
+    "cfg_llm_provider": None,     # user picks: huggingface | ollama
+    "cfg_ollama_sel": None,       # user picks when provider=ollama
+    "cfg_ollama_custom": "",
+    "cfg_hf_sel": None,           # user picks when provider=huggingface
+    "cfg_hf_custom": "",
+    "cfg_hf_quantize": "none",
+    "cfg_hf_max_tokens": 512,
+}
 
 
 # ─── Page config + styling ────────────────────────────────────────────────
@@ -274,29 +301,84 @@ def banner(kind: str, text: str) -> None:
     )
 
 
+# ─── Fresh-load detection ─────────────────────────────────────────────────
+# Generate a token that lives for the life of the Streamlit server process.
+# Compare it to a token in the URL: mismatch means the user just reloaded
+# (or hit the app fresh, or the server restarted) — so wipe everything.
+
+@st.cache_resource
+def _server_boot_token() -> str:
+    import secrets
+    return secrets.token_hex(6)
+
+_BOOT_TOKEN = _server_boot_token()
+
+
+def _hard_reset_session() -> None:
+    """Wipe every key in session_state, release resources, clear caches.
+
+    Explicitly re-stamps all cfg_* defaults and bumps _ui_nonce so widgets
+    that Streamlit tracks internally (position-based, no key=) are forced to
+    re-instantiate on the next rerun — otherwise their cached state leaks
+    back and silently overwrites the reset values after widgets render.
+    """
+    pipe = st.session_state.get("pipeline")
+    if pipe is not None:
+        try:
+            pipe._release_chroma()
+        except Exception:
+            pass
+    # Preserve and bump the nonce before wiping; widget keys suffixed with
+    # this nonce become fresh widget identities for Streamlit.
+    next_nonce = int(st.session_state.get("_ui_nonce", 0)) + 1
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+    st.session_state["_ui_nonce"] = next_nonce
+    # Re-stamp cfg defaults + non-cfg state so the header chips (which read
+    # cfg_* directly) and widgets that render after a reset both see correct
+    # values even within the *same* render pass.
+    for k, v in _DEFAULT_CFG.items():
+        st.session_state[k] = v
+    st.session_state["pipeline"] = None
+    st.session_state["pipeline_signature"] = None
+    st.session_state["chat_history"] = []
+    st.session_state["ingested_files"] = []
+    st.session_state["step"] = 1
+    import gc
+    gc.collect()
+
+
+def _wk(base: str) -> str:
+    """Widget key namespaced by the reset nonce — each Reset bumps the
+    nonce, giving every widget a fresh identity so Streamlit can't carry
+    cached widget state across a reset."""
+    return f"{base}__v{st.session_state.get('_ui_nonce', 0)}"
+
+
+# URL token drives the reset. On a fresh browser load (or reload) the URL
+# has no `s` param OR a stale one — we wipe state and stamp the current boot
+# token, then rerun.
+_url_token = st.query_params.get("s")
+if _url_token != _BOOT_TOKEN:
+    _hard_reset_session()
+    st.query_params["s"] = _BOOT_TOKEN
+    st.rerun()
+
+
 # ─── Session state ────────────────────────────────────────────────────────
 
+st.session_state.setdefault("_ui_nonce", 0)
 st.session_state.setdefault("pipeline", None)
 st.session_state.setdefault("pipeline_signature", None)
 st.session_state.setdefault("chat_history", [])
 st.session_state.setdefault("ingested_files", [])
 st.session_state.setdefault("step", 1)
 
-# Config widget defaults (persisted via widget keys)
-st.session_state.setdefault("cfg_backend", "both")
-st.session_state.setdefault("cfg_chunking", "fixed")
-st.session_state.setdefault("cfg_top_k", 4)
-st.session_state.setdefault("cfg_chunk_size", 1200)
-st.session_state.setdefault("cfg_chunk_overlap", 200)
-st.session_state.setdefault("cfg_emb_sel", EMBEDDING_PRESETS[0])
-st.session_state.setdefault("cfg_emb_custom", EMBEDDING_PRESETS[0])
-st.session_state.setdefault("cfg_llm_provider", "ollama")
-st.session_state.setdefault("cfg_ollama_sel", OLLAMA_LLM_PRESETS[0])
-st.session_state.setdefault("cfg_ollama_custom", "llama3")
-st.session_state.setdefault("cfg_hf_sel", HF_LLM_PRESETS[0])
-st.session_state.setdefault("cfg_hf_custom", "Qwen/Qwen2.5-1.5B-Instruct")
-st.session_state.setdefault("cfg_hf_quantize", "none")
-st.session_state.setdefault("cfg_hf_max_tokens", 512)
+# Config widget defaults. Keys set to None are user picks with no default —
+# the UI forces an explicit choice (disabled Next until set) and chips show
+# em-dashes. Keep in sync with _DEFAULT_CFG above.
+for _k, _v in _DEFAULT_CFG.items():
+    st.session_state.setdefault(_k, _v)
 
 
 def _effective(sel_key: str, custom_key: str) -> str:
@@ -322,16 +404,67 @@ def current_config() -> dict:
     }
 
 
+def _enum_val(x) -> str:
+    """Read .value off an enum, or return the str — model_copy(update=...) can
+    leave a field as a raw string if pydantic skipped re-validation."""
+    return getattr(x, "value", x) if not isinstance(x, str) else x
+
+
+def _pipe_matches_ui(pipe: RAGPipeline, c: dict) -> bool:
+    """Hard check: does the pipeline's actual settings match what the UI shows?
+
+    Last line of defense against stale cached pipelines. If any key field
+    mismatches, we force a rebuild regardless of the signature cache.
+    If the UI has required picks unset, the pipeline can't match by
+    construction — return False so callers invalidate the stale pipeline.
+    """
+    s = pipe.settings
+    if not c.get("llm_provider") or not c.get("backend"):
+        return False
+    if s.llm_provider.lower() != c["llm_provider"].lower():
+        return False
+    if _enum_val(s.retrieval_backend) != c["backend"]:
+        return False
+    if _enum_val(s.chunking_strategy) != c["chunking"]:
+        return False
+    if s.embedding_model != c["embedding_model"]:
+        return False
+    if s.llm_provider.lower() == "ollama" and s.ollama_model != (c.get("ollama_model") or ""):
+        return False
+    if s.llm_provider.lower() == "huggingface" and s.hf_model != (c.get("hf_model") or ""):
+        return False
+    return True
+
+
+def _invalidate_pipeline() -> None:
+    pipe = st.session_state.pipeline
+    if pipe is not None:
+        try:
+            pipe._release_chroma()
+        except Exception:
+            pass
+    st.session_state.pipeline = None
+    st.session_state.pipeline_signature = None
+    import gc
+    gc.collect()
+
+
 def ensure_pipeline() -> RAGPipeline | None:
     """Auto-build the pipeline if missing or out of sync with current config."""
-    current_sig = tuple(sorted(current_config().items()))
-    active_sig = st.session_state.pipeline_signature
+    c = current_config()
     pipe = st.session_state.pipeline
 
-    if pipe is not None and active_sig == current_sig:
+    # Hard sanity check: if the cached pipeline doesn't match what the UI
+    # shows, wipe it. This is stricter than the signature comparison and
+    # catches any drift that sig caching might miss.
+    if pipe is not None and not _pipe_matches_ui(pipe, c):
+        _invalidate_pipeline()
+        pipe = None
+
+    if pipe is not None:
         return pipe
 
-    is_first_load = pipe is None
+    is_first_load = st.session_state.pipeline_signature is None
     spinner_msg = (
         "Loading pipeline (first run downloads models — may take a minute)…"
         if is_first_load
@@ -340,61 +473,117 @@ def ensure_pipeline() -> RAGPipeline | None:
     try:
         with st.spinner(spinner_msg):
             pipe = build_pipeline()
+            # Verify what we actually built matches what the UI asked for —
+            # if not, something is structurally broken and we should surface it.
+            if not _pipe_matches_ui(pipe, c):
+                raise RuntimeError(
+                    f"Built pipeline has llm_provider={pipe.settings.llm_provider!r} "
+                    f"but UI requested {c['llm_provider']!r} — settings override failed."
+                )
             st.session_state.pipeline = pipe
-            st.session_state.pipeline_signature = current_sig
+            st.session_state.pipeline_signature = tuple(sorted(c.items()))
         return pipe
     except Exception as e:
         banner("error", f"Pipeline initialization failed: {e}")
         return None
 
 
+def _missing_config_fields(c: dict) -> list[str]:
+    """Names of required user picks that haven't been made yet."""
+    missing: list[str] = []
+    if not c.get("backend"):
+        missing.append("backend (Step 1)")
+    p = c.get("llm_provider")
+    if not p:
+        missing.append("LLM provider (Step 2)")
+    elif p == "ollama" and not c.get("ollama_model"):
+        missing.append("Ollama model (Step 2)")
+    elif p == "huggingface" and not c.get("hf_model"):
+        missing.append("HuggingFace model (Step 2)")
+    return missing
+
+
 def build_pipeline() -> RAGPipeline:
+    """Build a RAGPipeline with explicit settings — no env-var dance, no .env fallback."""
+    from rag_brain.config import Settings, RetrievalBackend, ChunkingStrategy
+
     c = current_config()
-    os.environ["RAG_BACKEND"] = c["backend"]
-    os.environ["CHUNKING_STRATEGY"] = c["chunking"]
-    os.environ["TOP_K"] = str(c["top_k"])
-    os.environ["CHUNK_SIZE"] = str(c["chunk_size"])
-    os.environ["CHUNK_OVERLAP"] = str(c["chunk_overlap"])
-    os.environ["EMBEDDING_MODEL"] = c["embedding_model"]
-    os.environ["LLM_PROVIDER"] = c["llm_provider"]
-    if c["llm_provider"] == "ollama":
-        os.environ["OLLAMA_MODEL"] = c["ollama_model"]
-        os.environ.pop("HF_QUANTIZE", None)
-    else:
-        os.environ["HF_MODEL"] = c["hf_model"]
-        os.environ["HF_MAX_NEW_TOKENS"] = str(c["hf_max_new_tokens"])
-        if c["hf_quantize"] != "none":
-            os.environ["HF_QUANTIZE"] = c["hf_quantize"]
-        else:
-            os.environ.pop("HF_QUANTIZE", None)
-    return RAGPipeline(load_settings())
+    missing = _missing_config_fields(c)
+    if missing:
+        raise ValueError("Please make a selection for: " + ", ".join(missing) + ".")
+    # Start from file-based settings so Neo4j credentials, paths, etc. still come
+    # from .env, then override every UI-controlled field explicitly.
+    base = load_settings()
+    # Re-validate everything so enum fields stay real enums after the override
+    # (model_copy with raw strings keeps them as strings, which breaks .value).
+    data = base.model_dump()
+    data.update({
+        "retrieval_backend": RetrievalBackend(c["backend"]),
+        "chunking_strategy": ChunkingStrategy(c["chunking"]),
+        "top_k": int(c["top_k"]),
+        "chunk_size": int(c["chunk_size"]),
+        "chunk_overlap": int(c["chunk_overlap"]),
+        "embedding_model": c["embedding_model"],
+        "llm_provider": c["llm_provider"],
+        "ollama_model": c["ollama_model"] or "",
+        "hf_model": c["hf_model"] or "",
+        "hf_max_new_tokens": int(c["hf_max_new_tokens"]),
+        "hf_quantize": None if c["hf_quantize"] == "none" else c["hf_quantize"],
+    })
+    settings = Settings(**data)
+    return RAGPipeline(settings)
+
+
+# ─── Config-drift detection ───────────────────────────────────────────────
+# If the cached pipeline's actual settings don't match what the UI shows
+# right now, drop it. The next chat/ingest will rebuild.
+
+if (
+    st.session_state.pipeline is not None
+    and not _pipe_matches_ui(st.session_state.pipeline, current_config())
+):
+    _invalidate_pipeline()
 
 
 # ─── Header ───────────────────────────────────────────────────────────────
 
-st.markdown("# ◆ RAG OpenLLMs")
-st.markdown(
-    '<span class="muted">Hybrid retrieval over Chroma + Neo4j with open-source LLMs.</span>',
-    unsafe_allow_html=True,
-)
-
-pipe: RAGPipeline | None = st.session_state.pipeline
-if pipe is None:
+_hdr_l, _hdr_r = st.columns([5, 1])
+with _hdr_l:
+    st.markdown("# ◆ RAG OpenLLMs")
     st.markdown(
-        '<div class="status-bar"><span class="chip"><b>status</b>not initialized</span></div>',
+        '<span class="muted">Hybrid retrieval over Chroma + Neo4j with open-source LLMs.</span>',
         unsafe_allow_html=True,
     )
-else:
-    s = pipe.settings
-    llm_label = s.ollama_model if s.llm_provider == "ollama" else s.hf_model
-    chips = [
-        ("backend", s.retrieval_backend.value),
-        ("chunking", s.chunking_strategy.value),
-        ("top-k", str(s.top_k)),
-        ("llm", f"{s.llm_provider}:{llm_label.split('/')[-1]}"),
-    ]
-    html = "".join(f'<span class="chip"><b>{k}</b>{v}</span>' for k, v in chips)
-    st.markdown(f'<div class="status-bar">{html}</div>', unsafe_allow_html=True)
+with _hdr_r:
+    st.markdown('<div style="margin-top: 1.5rem;"></div>', unsafe_allow_html=True)
+    if st.button("⟲ Reset", use_container_width=True, key="header_reset",
+                 help="Wipe all selections, uploads, chat history, and cached pipeline."):
+        _hard_reset_session()
+        st.rerun()
+
+pipe: RAGPipeline | None = st.session_state.pipeline
+_cfg_now = current_config()
+
+
+def _llm_chip(cfg: dict) -> str:
+    p = cfg.get("llm_provider")
+    if not p:
+        return "—"
+    model = cfg.get("ollama_model") if p == "ollama" else cfg.get("hf_model")
+    if not model:
+        return f"{p}:—"
+    return f"{p}:{model.split('/')[-1]}"
+
+
+chips = [
+    ("backend", _cfg_now["backend"] or "—"),
+    ("chunking", _cfg_now["chunking"] or "—"),
+    ("top-k", str(_cfg_now["top_k"]) if _cfg_now["top_k"] is not None else "—"),
+    ("llm", _llm_chip(_cfg_now)),
+    ("status", "active" if pipe is not None else "not initialized"),
+]
+_chips_html = "".join(f'<span class="chip"><b>{k}</b>{v}</span>' for k, v in chips)
+st.markdown(f'<div class="status-bar">{_chips_html}</div>', unsafe_allow_html=True)
 
 st.markdown('<hr>', unsafe_allow_html=True)
 
@@ -439,23 +628,31 @@ except ImportError:
     from tqdm.auto import tqdm as _BaseTqdm
 
 
-class StreamlitTqdm(_BaseTqdm):
-    """tqdm subclass that pipes byte-download progress into a Streamlit progress bar.
+import threading as _threading
 
-    snapshot_download creates ONE parent bar (unit="B", total=0 initially), then
-    mutates `self.total` as each file's size is discovered, and calls update(n)
-    as bytes arrive. We read `self.n` and `self.total` on every tick so the
-    Streamlit bar always reflects current progress.
+
+class StreamlitTqdm(_BaseTqdm):
+    """Thread-safe byte counter for snapshot_download.
+
+    HF parallelizes downloads across worker threads, so calling Streamlit
+    widgets directly from tqdm.update() (which runs on those threads) silently
+    no-ops. Instead we just update class-level counters under a lock; the main
+    thread polls them and renders the Streamlit progress bar.
     """
-    _st_placeholder = None  # class-level handle to the st.progress widget
+    _lock = _threading.Lock()
+    _done = 0
+    _total = 0
 
     @classmethod
-    def reset_state(cls, placeholder) -> None:
-        cls._st_placeholder = placeholder
+    def reset_counters(cls) -> None:
+        with cls._lock:
+            cls._done = 0
+            cls._total = 0
 
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("leave", False)
         kwargs.setdefault("mininterval", 0.05)
+        kwargs["disable"] = False
         unit = kwargs.get("unit") or ""
         self._sl_is_bytes = isinstance(unit, str) and unit.startswith("B")
         try:
@@ -463,87 +660,102 @@ class StreamlitTqdm(_BaseTqdm):
         except TypeError:
             safe = {k: v for k, v in kwargs.items() if k != "name"}
             super().__init__(*args, **safe)
-        self._sl_render()
+        self.disable = False
 
     def update(self, n=1):
         try:
             super().update(n)
         except Exception:
             pass
-        self._sl_render()
+        if getattr(self, "_sl_is_bytes", False):
+            with StreamlitTqdm._lock:
+                StreamlitTqdm._done = int(getattr(self, "n", 0) or 0)
+                StreamlitTqdm._total = int(getattr(self, "total", 0) or 0)
 
     def refresh(self, *args, **kwargs):
         try:
             super().refresh(*args, **kwargs)
         except Exception:
             pass
-        self._sl_render()
+        if getattr(self, "_sl_is_bytes", False):
+            with StreamlitTqdm._lock:
+                StreamlitTqdm._done = int(getattr(self, "n", 0) or 0)
+                StreamlitTqdm._total = int(getattr(self, "total", 0) or 0)
 
     def display(self, msg=None, pos=None):
         return True
 
-    def _sl_render(self) -> None:
-        if not getattr(self, "_sl_is_bytes", False):
-            return
-        ph = StreamlitTqdm._st_placeholder
-        if ph is None:
-            return
-        total = getattr(self, "total", 0) or 0
-        current = getattr(self, "n", 0) or 0
-        if total > 0:
-            frac = min(max(current / total, 0.0), 1.0)
-            text = f"{human_size(current)} / {human_size(total)}"
-        else:
-            frac = 0.0
-            text = f"Fetching file list…  {human_size(current)} downloaded"
-        try:
-            ph.progress(frac, text=text)
-        except Exception:
-            pass
-
 
 def download_hf_model(repo_id: str) -> None:
     """Download a HuggingFace model with a live Streamlit progress bar."""
+    import importlib
     import inspect
     import logging
+    import threading
     import time
 
     with st.status(f"Downloading {repo_id}…", expanded=True) as status:
         progress = st.progress(0.0, text="Connecting to HuggingFace Hub…")
-        StreamlitTqdm.reset_state(progress)
+        StreamlitTqdm.reset_counters()
 
-        # HF disables its tqdm when the huggingface_hub logger is at ERROR level.
-        # rag_brain/__init__.py sets it to ERROR for quietness — override here
-        # so progress updates actually flow through.
+        # --- HF progress bar plumbing (run on main thread, before worker starts) ---
         hf_logger = logging.getLogger("huggingface_hub")
         original_level = hf_logger.level
         hf_logger.setLevel(logging.INFO)
-
         os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+        original_flag = None
+        _hf_tqdm_mod = None
         try:
-            from huggingface_hub.utils import enable_progress_bars
-            enable_progress_bars()
+            _hf_tqdm_mod = importlib.import_module("huggingface_hub.utils.tqdm")
+            original_flag = _hf_tqdm_mod.HF_HUB_DISABLE_PROGRESS_BARS
+            _hf_tqdm_mod.HF_HUB_DISABLE_PROGRESS_BARS = False
+            _hf_tqdm_mod.progress_bar_states["_global"] = True
         except Exception:
             pass
 
+        # --- Run snapshot_download on a worker thread ---
+        result: dict = {}
+
+        def _worker():
+            try:
+                from huggingface_hub import snapshot_download
+                kwargs: dict = {"repo_id": repo_id}
+                sig = inspect.signature(snapshot_download)
+                if "tqdm_class" in sig.parameters:
+                    kwargs["tqdm_class"] = StreamlitTqdm
+                result["path"] = snapshot_download(**kwargs)
+            except Exception as e:
+                result["error"] = e
+
+        t0 = time.time()
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+
         try:
-            from huggingface_hub import snapshot_download
+            # Poll counters from the main thread — only the main thread can
+            # push widget updates to the Streamlit frontend.
+            while worker.is_alive():
+                with StreamlitTqdm._lock:
+                    done = StreamlitTqdm._done
+                    total = StreamlitTqdm._total
+                if total > 0:
+                    frac = min(max(done / total, 0.0), 1.0)
+                    text = f"{human_size(done)} / {human_size(total)}  ·  {frac * 100:.1f}%"
+                else:
+                    frac = 0.0
+                    text = f"Fetching file list…  {human_size(done)} downloaded"
+                try:
+                    progress.progress(frac, text=text)
+                except Exception:
+                    pass
+                time.sleep(0.15)
+            worker.join(timeout=2)
 
-            kwargs: dict = {"repo_id": repo_id}
-            sig = inspect.signature(snapshot_download)
-            if "tqdm_class" in sig.parameters:
-                kwargs["tqdm_class"] = StreamlitTqdm
-            else:
-                status.write(
-                    "Note: your `huggingface_hub` is too old for live progress. "
-                    "Run `pip install -U huggingface_hub` to enable the bar. "
-                    "Download will still proceed — check the terminal for progress."
-                )
-
-            t0 = time.time()
-            path = snapshot_download(**kwargs)
+            if "error" in result:
+                raise result["error"]
+            path = result.get("path", "?")
             elapsed = time.time() - t0
-            total = get_hf_cache_size(repo_id) or 0
+            total = get_hf_cache_size(repo_id) or StreamlitTqdm._total or 0
             progress.progress(1.0, text=f"✓ {human_size(total)} in {elapsed:.1f}s")
             status.write(f"Local path: `{path}`")
             status.update(label=f"✓ {repo_id} ready ({human_size(total)})", state="complete")
@@ -551,7 +763,8 @@ def download_hf_model(repo_id: str) -> None:
             status.update(label=f"Download failed: {e}", state="error")
         finally:
             hf_logger.setLevel(original_level)
-            StreamlitTqdm._st_placeholder = None
+            if _hf_tqdm_mod is not None and original_flag is not None:
+                _hf_tqdm_mod.HF_HUB_DISABLE_PROGRESS_BARS = original_flag
 
 
 def list_hf_cached_repos() -> list[dict]:
@@ -617,6 +830,34 @@ def render_hf_model_card(repo_id: str, key: str, kind: str) -> None:
         if st.button(label, key=f"dl_btn_{key}", use_container_width=True, type=btn_type):
             download_hf_model(repo_id)
             st.rerun()
+
+
+# Reasoning-model outputs (Qwen, DeepSeek-R1, QwQ, …) wrap chain-of-thought
+# in <think>…</think>. Strip those before rendering so the chat shows only
+# the final answer; surface the reasoning in a collapsed expander instead.
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
+_OPEN_THINK_RE = re.compile(r"<think>.*", re.DOTALL | re.IGNORECASE)
+
+
+def _split_thinking(text: str) -> tuple[str, str]:
+    """Return (thinking, answer) with all <think>…</think> blocks extracted."""
+    if not text:
+        return "", text or ""
+    thinking_parts = _THINK_RE.findall(text)
+    answer = _THINK_RE.sub("", text)
+    # Handle truncated generation where </think> never arrived.
+    if "<think>" in answer.lower():
+        answer = _OPEN_THINK_RE.sub("", answer)
+    thinking = "\n\n".join(p.strip() for p in thinking_parts if p.strip())
+    return thinking, answer.strip()
+
+
+def _render_assistant_message(content: str) -> None:
+    thinking, answer = _split_thinking(content)
+    if thinking:
+        with st.expander("Reasoning", expanded=False):
+            st.markdown(thinking)
+    st.markdown(answer or "_(empty answer)_")
 
 
 def _render_retrieved(retrieved: list[dict]) -> None:
@@ -694,36 +935,63 @@ def step_retrieval() -> None:
     st.markdown("")
 
     st.markdown("### Backend")
-    st.radio(
+    backend_options = ["vector", "both", "neo4j"]
+    backend_current = st.session_state.cfg_backend
+    _b_idx = backend_options.index(backend_current) if backend_current in backend_options else None
+    chosen_backend = st.radio(
         "Retrieval backend",
-        ["both", "vector", "neo4j"],
+        backend_options,
+        index=_b_idx,
         horizontal=True,
-        key="cfg_backend",
         label_visibility="collapsed",
-        help="both = hybrid Chroma + Neo4j · vector = Chroma only · neo4j = Neo4jVector only",
+        help="vector = Chroma only (no external server) · both = Chroma + Neo4j · neo4j = Neo4jVector only",
+        key=_wk("cfg_backend"),
     )
-    if st.session_state.cfg_backend in ("neo4j", "both"):
+    st.session_state.cfg_backend = chosen_backend
+    if chosen_backend:
+        st.caption(f"Selected backend: **{chosen_backend}**")
+    else:
+        st.caption("_Pick a backend to continue._")
+    if chosen_backend in ("neo4j", "both"):
         banner("info", "Neo4j credentials are read from <code>.env</code> (NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD).")
 
     st.markdown("### Chunking")
     c1, c2 = st.columns(2)
+    chunking_opts = ["fixed", "semantic"]
     with c1:
-        st.radio(
+        chosen_chunking = st.radio(
             "Strategy",
-            ["fixed", "semantic"],
+            chunking_opts,
+            index=chunking_opts.index(st.session_state.cfg_chunking),
             horizontal=True,
-            key="cfg_chunking",
+            key=_wk("cfg_chunking"),
             help="fixed = RecursiveCharacterTextSplitter · semantic = embedding-based breakpoints",
         )
+        st.session_state.cfg_chunking = chosen_chunking
     with c2:
-        st.slider("Top-k retrieved chunks", 1, 20, key="cfg_top_k")
+        chosen_top_k = st.slider(
+            "Top-k retrieved chunks", 1, 20,
+            value=int(st.session_state.cfg_top_k),
+            key=_wk("cfg_top_k"),
+        )
+        st.session_state.cfg_top_k = int(chosen_top_k)
 
     if st.session_state.cfg_chunking == "fixed":
         c3, c4 = st.columns(2)
         with c3:
-            st.number_input("Chunk size", 200, 4000, step=100, key="cfg_chunk_size")
+            chosen_size = st.number_input(
+                "Chunk size", 200, 4000, step=100,
+                value=int(st.session_state.cfg_chunk_size),
+                key=_wk("cfg_chunk_size"),
+            )
+            st.session_state.cfg_chunk_size = int(chosen_size)
         with c4:
-            st.number_input("Chunk overlap", 0, 1000, step=50, key="cfg_chunk_overlap")
+            chosen_overlap = st.number_input(
+                "Chunk overlap", 0, 1000, step=50,
+                value=int(st.session_state.cfg_chunk_overlap),
+                key=_wk("cfg_chunk_overlap"),
+            )
+            st.session_state.cfg_chunk_overlap = int(chosen_overlap)
 
 
 # ─── Step 2: Models ───────────────────────────────────────────────────────
@@ -739,52 +1007,128 @@ def step_models() -> None:
     st.markdown("### Embedding model")
     e1, e2 = st.columns([3, 2])
     with e1:
-        st.selectbox("Preset", EMBEDDING_PRESETS, key="cfg_emb_sel")
+        emb_current = st.session_state.cfg_emb_sel
+        if emb_current not in EMBEDDING_PRESETS:
+            emb_current = EMBEDDING_PRESETS[0]
+            st.session_state.cfg_emb_sel = emb_current
+        chosen_emb = st.selectbox(
+            "Preset",
+            EMBEDDING_PRESETS,
+            index=EMBEDDING_PRESETS.index(emb_current),
+            key=_wk("cfg_emb_sel"),
+        )
+        st.session_state.cfg_emb_sel = chosen_emb
     with e2:
-        if st.session_state.cfg_emb_sel == "Custom…":
-            st.text_input("Custom HF model ID", key="cfg_emb_custom")
+        if chosen_emb == "Custom…":
+            custom_emb = st.text_input(
+                "Custom HF model ID",
+                value=st.session_state.cfg_emb_custom,
+                key=_wk("cfg_emb_custom"),
+            )
+            st.session_state.cfg_emb_custom = custom_emb
 
     emb_id = _effective("cfg_emb_sel", "cfg_emb_custom")
+    st.caption(f"Selected embedding model: **{emb_id}**")
     render_hf_model_card(emb_id, key="emb", kind="Embedding")
 
     st.markdown("### LLM")
-    st.radio(
+    provider_options = ["huggingface", "ollama"]
+    provider_current = st.session_state.cfg_llm_provider
+    _p_idx = provider_options.index(provider_current) if provider_current in provider_options else None
+    chosen_provider = st.radio(
         "Provider",
-        ["ollama", "huggingface"],
+        provider_options,
+        index=_p_idx,
         horizontal=True,
-        key="cfg_llm_provider",
-        help="ollama = local inference via Ollama server · huggingface = direct transformers pipeline",
+        help="huggingface = local transformers pipeline (no server needed) · ollama = local Ollama server",
+        key=_wk("cfg_llm_provider"),
     )
-
-    if st.session_state.cfg_llm_provider == "ollama":
-        l1, l2 = st.columns([3, 2])
-        with l1:
-            st.selectbox("Model preset", OLLAMA_LLM_PRESETS, key="cfg_ollama_sel")
-        with l2:
-            if st.session_state.cfg_ollama_sel == "Custom…":
-                st.text_input("Custom Ollama model", key="cfg_ollama_custom")
-        eff = _effective("cfg_ollama_sel", "cfg_ollama_custom")
-        banner("info", f"Ollama models are pulled via the Ollama CLI. Run <code>ollama pull {eff}</code> in your terminal.")
+    st.session_state.cfg_llm_provider = chosen_provider
+    if chosen_provider:
+        st.caption(f"Selected LLM provider: **{chosen_provider}**")
     else:
+        st.caption("_Pick a provider to continue._")
+
+    if chosen_provider == "ollama":
         l1, l2 = st.columns([3, 2])
         with l1:
-            st.selectbox("Model preset", HF_LLM_PRESETS, key="cfg_hf_sel")
+            ollama_current = st.session_state.cfg_ollama_sel
+            _o_idx = OLLAMA_LLM_PRESETS.index(ollama_current) if ollama_current in OLLAMA_LLM_PRESETS else None
+            chosen_ollama = st.selectbox(
+                "Model preset",
+                OLLAMA_LLM_PRESETS,
+                index=_o_idx,
+                placeholder="Choose an Ollama model…",
+                key=_wk("cfg_ollama_sel"),
+            )
+            st.session_state.cfg_ollama_sel = chosen_ollama
         with l2:
-            if st.session_state.cfg_hf_sel == "Custom…":
-                st.text_input("Custom HF model ID", key="cfg_hf_custom")
+            if chosen_ollama == "Custom…":
+                custom = st.text_input(
+                    "Custom Ollama model",
+                    value=st.session_state.cfg_ollama_custom,
+                    key=_wk("cfg_ollama_custom"),
+                )
+                st.session_state.cfg_ollama_custom = custom
+        eff = _effective("cfg_ollama_sel", "cfg_ollama_custom") if chosen_ollama else ""
+        if eff:
+            st.caption(f"Selected Ollama model: **{eff}**")
+            banner("info", f"Ollama models are pulled via the Ollama CLI. Run <code>ollama pull {eff}</code> in your terminal.")
+        else:
+            st.caption("_Pick a model to continue._")
+    elif chosen_provider == "huggingface":
+        l1, l2 = st.columns([3, 2])
+        with l1:
+            hf_current = st.session_state.cfg_hf_sel
+            _h_idx = HF_LLM_PRESETS.index(hf_current) if hf_current in HF_LLM_PRESETS else None
+            chosen_hf = st.selectbox(
+                "Model preset",
+                HF_LLM_PRESETS,
+                index=_h_idx,
+                placeholder="Choose a HuggingFace model…",
+                key=_wk("cfg_hf_sel"),
+            )
+            st.session_state.cfg_hf_sel = chosen_hf
+        with l2:
+            if chosen_hf == "Custom…":
+                custom_hf = st.text_input(
+                    "Custom HF model ID",
+                    value=st.session_state.cfg_hf_custom,
+                    key=_wk("cfg_hf_custom"),
+                )
+                st.session_state.cfg_hf_custom = custom_hf
         q1, q2 = st.columns(2)
         with q1:
-            st.selectbox(
+            quant_opts = ["none", "4bit", "8bit"]
+            quant_current = st.session_state.cfg_hf_quantize
+            if quant_current not in quant_opts:
+                quant_current = "none"
+                st.session_state.cfg_hf_quantize = quant_current
+            chosen_quant = st.selectbox(
                 "Quantization",
-                ["none", "4bit", "8bit"],
-                key="cfg_hf_quantize",
+                quant_opts,
+                index=quant_opts.index(quant_current),
                 help="4/8-bit uses bitsandbytes — requires CUDA.",
+                key=_wk("cfg_hf_quantize"),
             )
+            st.session_state.cfg_hf_quantize = chosen_quant
         with q2:
-            st.number_input("Max new tokens", 64, 4096, step=64, key="cfg_hf_max_tokens")
+            mnt = st.number_input(
+                "Max new tokens",
+                64,
+                4096,
+                value=int(st.session_state.cfg_hf_max_tokens),
+                step=64,
+                key=_wk("cfg_hf_max_tokens"),
+            )
+            st.session_state.cfg_hf_max_tokens = int(mnt)
 
-        hf_id = _effective("cfg_hf_sel", "cfg_hf_custom")
-        render_hf_model_card(hf_id, key="hf_llm", kind="LLM")
+        hf_id = _effective("cfg_hf_sel", "cfg_hf_custom") if chosen_hf else ""
+        if hf_id:
+            st.caption(f"Selected HF model: **{hf_id}** · quantization: **{chosen_quant}**")
+            render_hf_model_card(hf_id, key="hf_llm", kind="LLM")
+        else:
+            st.caption("_Pick a model to continue._")
 
     # Cache management
     st.markdown("")
@@ -862,7 +1206,7 @@ def step_documents() -> None:
         "Upload PDF or DOCX",
         type=["pdf", "docx"],
         accept_multiple_files=True,
-        key="main_uploader",
+        key=_wk("main_uploader"),
     )
 
     u1, u2 = st.columns([3, 2])
@@ -896,6 +1240,8 @@ def step_documents() -> None:
                     n = pipe.ingest(tmp_path, recreate=(recreate and i == 0))
                     total += n
                     st.session_state.ingested_files.append({"name": uf.name, "chunks": n})
+                    for w in getattr(pipe, "last_ingest_warnings", []) or []:
+                        banner("warning", w)
                 except Exception as e:
                     banner("error", f"Failed on <code>{uf.name}</code>: {e}")
                 finally:
@@ -937,12 +1283,52 @@ def step_chat() -> None:
             st.session_state.chat_history = []
             st.rerun()
 
+    # Show exactly what the next query will use — prevents confusion between
+    # UI selections and cached pipeline state.
+    pipe_active = st.session_state.pipeline
+    cfg = current_config()
+    missing = _missing_config_fields(cfg)
+    ui_llm = _llm_chip(cfg)
+    s1, s2 = st.columns([3, 1])
+    with s1:
+        if missing:
+            banner("warning", "Missing selection: " + ", ".join(missing) + ". Go back and complete them before chatting.")
+        elif pipe_active is None:
+            banner("info", f"Will build pipeline on send → <b>LLM:</b> <code>{ui_llm}</code>")
+        else:
+            ps = pipe_active.settings
+            active_llm = (
+                f"{ps.llm_provider}:{(ps.ollama_model if ps.llm_provider == 'ollama' else ps.hf_model).split('/')[-1]}"
+            )
+            if active_llm == ui_llm:
+                banner("success", f"<b>Active LLM:</b> <code>{active_llm}</code>")
+            else:
+                banner(
+                    "warning",
+                    f"Config changed — will rebuild on send. Active now: <code>{active_llm}</code> → next: <code>{ui_llm}</code>",
+                )
+    with s2:
+        if st.button("⟲ Force rebuild", use_container_width=True, key="force_rebuild"):
+            try:
+                if pipe_active is not None:
+                    pipe_active._release_chroma()
+            except Exception:
+                pass
+            st.session_state.pipeline = None
+            st.session_state.pipeline_signature = None
+            import gc
+            gc.collect()
+            st.rerun()
+
     if not st.session_state.ingested_files:
         banner("warning", "You haven't ingested any documents — answers will have no context. Go back to <b>Step 3</b>.")
 
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+            if msg["role"] == "assistant":
+                _render_assistant_message(msg["content"])
+            else:
+                st.markdown(msg["content"])
             if msg.get("retrieved"):
                 _render_retrieved(msg["retrieved"])
 
@@ -961,7 +1347,7 @@ def step_chat() -> None:
                         banner("error", f"Query failed: {e}")
                         out = None
                 if out is not None:
-                    st.markdown(out["answer"])
+                    _render_assistant_message(out["answer"])
                     retrieved = out.get("retrieved", [])
                     _render_retrieved(retrieved)
                     st.session_state.chat_history.append(
@@ -976,10 +1362,10 @@ render_stepper(st.session_state.step)
 step = st.session_state.step
 if step == 1:
     step_retrieval()
-    render_nav()
+    render_nav(next_disabled=not st.session_state.cfg_backend)
 elif step == 2:
     step_models()
-    render_nav()
+    render_nav(next_disabled=bool(_missing_config_fields(current_config())))
 elif step == 3:
     step_documents()
     render_nav(
@@ -996,6 +1382,6 @@ elif step == 4:
             st.session_state.step -= 1
             st.rerun()
     with br:
-        if st.button("⟲ Start over", use_container_width=True, key="restart"):
-            st.session_state.step = 1
+        if st.button("⟲ Reset everything", use_container_width=True, key="restart"):
+            _hard_reset_session()
             st.rerun()

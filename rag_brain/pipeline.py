@@ -145,20 +145,62 @@ class RAGPipeline:
     # ── Ingestion ──────────────────────────────────────────────────────
 
     def ingest(self, file_path: Path | str, *, recreate: bool = True) -> int:
-        """Load a document (PDF/DOCX), chunk, embed, and store. Returns chunk count."""
+        """Load a document (PDF/DOCX), chunk, embed, and store. Returns chunk count.
+
+        When both backends are enabled, a failure in one is recorded in
+        `self.last_ingest_warnings` instead of aborting — so a missing Neo4j
+        server doesn't block Chroma from working (and vice versa).
+        """
         raw = load_documents(file_path)
         chunks = split_documents(raw, self.settings)
 
+        self.last_ingest_warnings: list[str] = []
+        successes = 0
+        backends_tried = int(self._use_chroma) + int(self._use_neo4j)
+
         if self._use_chroma:
-            self._ingest_chroma(chunks, recreate=recreate)
+            try:
+                self._ingest_chroma(chunks, recreate=recreate)
+                successes += 1
+            except Exception as e:
+                if backends_tried > 1:
+                    self.last_ingest_warnings.append(f"Chroma ingest failed: {e}")
+                else:
+                    raise
 
         if self._use_neo4j:
-            self._ingest_neo4j(chunks, recreate=recreate)
+            try:
+                self._ingest_neo4j(chunks, recreate=recreate)
+                successes += 1
+            except Exception as e:
+                if backends_tried > 1:
+                    self.last_ingest_warnings.append(f"Neo4j ingest failed: {e}")
+                else:
+                    raise
+
+        if successes == 0:
+            raise RuntimeError(
+                "All backends failed: " + " | ".join(self.last_ingest_warnings)
+            )
 
         return len(chunks)
 
     def _release_chroma(self) -> None:
         """Release file locks held by the Chroma client (needed on Windows before rmtree)."""
+        # Try to stop the underlying chromadb System so it releases SQLite handles.
+        store = self._chroma_store
+        if store is not None:
+            for attr_path in (("_client", "_system"), ("_client", "_server")):
+                obj = store
+                try:
+                    for a in attr_path:
+                        obj = getattr(obj, a, None)
+                        if obj is None:
+                            break
+                    if obj is not None and hasattr(obj, "stop"):
+                        obj.stop()
+                except Exception:
+                    pass
         self._chroma_store = None
         try:
             from chromadb.api.client import SharedSystemClient
@@ -170,11 +212,34 @@ class RAGPipeline:
 
     def _ingest_chroma(self, chunks: list[Document], *, recreate: bool) -> None:
         persist = self.settings.chroma_persist_dir
+
         if recreate:
+            # Fully wipe: release all cached chromadb clients, then physically
+            # delete the persist dir. Using delete_collection alone leaves
+            # orphaned UUID subdirs and can leave the in-memory client holding
+            # a stale collection ref across pipeline rebuilds.
             self._release_chroma()
             if persist.exists():
-                _rmtree_windows_safe(persist)
+                try:
+                    _rmtree_windows_safe(persist)
+                except Exception:
+                    # If rmtree still fails after our retries, drop the
+                    # collection via the API as a fallback so ingest doesn't
+                    # bomb entirely.
+                    try:
+                        import chromadb
+                        client = chromadb.PersistentClient(path=str(persist))
+                        try:
+                            client.delete_collection(name=self.settings.chroma_collection)
+                        except Exception:
+                            pass
+                        del client
+                        self._release_chroma()
+                    except Exception:
+                        pass
+
         persist.mkdir(parents=True, exist_ok=True)
+
         if recreate:
             self._chroma_store = Chroma.from_documents(
                 documents=chunks,
@@ -219,6 +284,24 @@ class RAGPipeline:
                 embedding_function=self._embeddings,
                 collection_name=s.chroma_collection,
             )
+            # Defensive: probe the collection. If chromadb's SQLite + on-disk
+            # state is inconsistent (stale UUID cached, orphan subdirs, etc.),
+            # wipe and re-open cleanly.
+            try:
+                self._chroma_store._collection.count()
+            except Exception:
+                self._release_chroma()
+                if s.chroma_persist_dir.exists():
+                    try:
+                        _rmtree_windows_safe(s.chroma_persist_dir)
+                    except Exception:
+                        pass
+                s.chroma_persist_dir.mkdir(parents=True, exist_ok=True)
+                self._chroma_store = Chroma(
+                    persist_directory=str(s.chroma_persist_dir),
+                    embedding_function=self._embeddings,
+                    collection_name=s.chroma_collection,
+                )
         return self._chroma_store
 
     def _ensure_neo4j(self) -> Neo4jVector:
@@ -239,17 +322,35 @@ class RAGPipeline:
     # ── Retrieval ──────────────────────────────────────────────────────
 
     def _retrieve(self, question: str) -> list[Document]:
-        """Retrieve from configured backends, merge and deduplicate."""
+        """Retrieve from configured backends, merge and deduplicate.
+
+        If one backend in a hybrid setup fails (e.g. Neo4j unreachable), we
+        fall back to the other and record the error on self.last_query_warnings.
+        """
         k = self.settings.top_k
         all_docs: list[Document] = []
+        self.last_query_warnings: list[str] = []
+        backends_tried = int(self._use_chroma) + int(self._use_neo4j)
 
         if self._use_chroma:
-            store = self._ensure_chroma()
-            all_docs.extend(store.similarity_search(question, k=k))
+            try:
+                store = self._ensure_chroma()
+                all_docs.extend(store.similarity_search(question, k=k))
+            except Exception as e:
+                if backends_tried > 1:
+                    self.last_query_warnings.append(f"Chroma retrieval failed: {e}")
+                else:
+                    raise
 
         if self._use_neo4j:
-            store = self._ensure_neo4j()
-            all_docs.extend(store.similarity_search(question, k=k))
+            try:
+                store = self._ensure_neo4j()
+                all_docs.extend(store.similarity_search(question, k=k))
+            except Exception as e:
+                if backends_tried > 1:
+                    self.last_query_warnings.append(f"Neo4j retrieval failed: {e}")
+                else:
+                    raise
 
         deduped = _deduplicate_docs(all_docs)
         # When using both backends we retrieve 2*k candidates; trim back to top_k
