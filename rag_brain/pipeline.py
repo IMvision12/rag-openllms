@@ -63,35 +63,37 @@ def _deduplicate_docs(docs: list[Document]) -> list[Document]:
     return unique
 
 
+_HF_MAX_NEW_TOKENS = 512
+
+
 def _build_hf_llm(settings: Settings):
     """Build a HuggingFace transformers pipeline wrapped as a chat model for LangChain."""
+    import os
     import torch
     from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
     from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+
+    # Mirror the token into HF_TOKEN / HUGGINGFACE_HUB_TOKEN so any HF
+    # utility (sentence-transformers, hub downloads) invoked in this
+    # process also authenticates — not just the explicit token= kwargs below.
+    if settings.hf_token:
+        os.environ["HF_TOKEN"] = settings.hf_token
+        os.environ["HUGGINGFACE_HUB_TOKEN"] = settings.hf_token
 
     model_kwargs: dict[str, Any] = {
         "device_map": "auto",
         "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
     }
 
-    if settings.hf_quantize == "4bit":
-        from transformers import BitsAndBytesConfig
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-        )
-    elif settings.hf_quantize == "8bit":
-        from transformers import BitsAndBytesConfig
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-
-    tokenizer = AutoTokenizer.from_pretrained(settings.hf_model)
-    model = AutoModelForCausalLM.from_pretrained(settings.hf_model, **model_kwargs)
+    token = settings.hf_token or None
+    tokenizer = AutoTokenizer.from_pretrained(settings.hf_model, token=token)
+    model = AutoModelForCausalLM.from_pretrained(settings.hf_model, token=token, **model_kwargs)
 
     pipe = pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=settings.hf_max_new_tokens,
+        max_new_tokens=_HF_MAX_NEW_TOKENS,
         temperature=0.1,
         do_sample=True,
         return_full_text=False,

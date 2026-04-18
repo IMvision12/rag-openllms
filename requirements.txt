@@ -20,7 +20,6 @@ torch>=2.0.0
 transformers>=4.40.0
 langchain-huggingface>=0.1.0
 accelerate>=0.30.0
-bitsandbytes>=0.43.0
 
 # Configuration
 python-dotenv>=1.0.0

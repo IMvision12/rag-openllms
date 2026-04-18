@@ -31,8 +31,24 @@ HF_LLM_PRESETS = [
 ]
 
 OLLAMA_LLM_PRESETS = [
-    "llama3", "llama3.1", "llama3.2", "mistral", "phi3",
-    "gemma2", "qwen2.5", "Custom…",
+    # Cloud-hosted (no local download; require `ollama run <name>` with a
+    # signed-in Ollama account and sufficient credits)
+    "kimi-k2.5:cloud",
+    "glm-5:cloud",
+    "minimax-m2.7:cloud",
+    "gemma4:31b-cloud",
+    "qwen3.5:397b-cloud",
+    "gpt-oss:120b-cloud",
+    "gpt-oss:20b-cloud",
+    # Local (pull via `ollama pull <name>`)
+    "gpt-oss:120b",
+    "gpt-oss:20b",
+    "gemma4:31b",
+    "gemma4:26b",
+    "gemma4:e4b",
+    "gemma4:e2b",
+    "deepseek-r1:8b",
+    "Custom…",
 ]
 
 EMBEDDING_PRESETS = [
@@ -67,8 +83,7 @@ _DEFAULT_CFG: dict = {
     "cfg_ollama_custom": "",
     "cfg_hf_sel": None,           # user picks when provider=huggingface
     "cfg_hf_custom": "",
-    "cfg_hf_quantize": "none",
-    "cfg_hf_max_tokens": 512,
+    "cfg_hf_token": "",           # optional, required for gated HF models
 }
 
 
@@ -399,8 +414,7 @@ def current_config() -> dict:
         "llm_provider": st.session_state.cfg_llm_provider,
         "ollama_model": _effective("cfg_ollama_sel", "cfg_ollama_custom"),
         "hf_model": _effective("cfg_hf_sel", "cfg_hf_custom"),
-        "hf_quantize": st.session_state.cfg_hf_quantize,
-        "hf_max_new_tokens": st.session_state.cfg_hf_max_tokens,
+        "hf_token": (st.session_state.cfg_hf_token or "").strip(),
     }
 
 
@@ -527,8 +541,7 @@ def build_pipeline() -> RAGPipeline:
         "llm_provider": c["llm_provider"],
         "ollama_model": c["ollama_model"] or "",
         "hf_model": c["hf_model"] or "",
-        "hf_max_new_tokens": int(c["hf_max_new_tokens"]),
-        "hf_quantize": None if c["hf_quantize"] == "none" else c["hf_quantize"],
+        "hf_token": c.get("hf_token") or "",
     })
     settings = Settings(**data)
     return RAGPipeline(settings)
@@ -686,8 +699,12 @@ class StreamlitTqdm(_BaseTqdm):
         return True
 
 
-def download_hf_model(repo_id: str) -> None:
-    """Download a HuggingFace model with a live Streamlit progress bar."""
+def download_hf_model(repo_id: str, token: str | None = None) -> None:
+    """Download a HuggingFace model with a live Streamlit progress bar.
+
+    `token`, when supplied, authorizes access to gated repos (Llama, Gemma,
+    Mistral, etc.). Without it, snapshot_download hits 401 for gated models.
+    """
     import importlib
     import inspect
     import logging
@@ -723,6 +740,8 @@ def download_hf_model(repo_id: str) -> None:
                 sig = inspect.signature(snapshot_download)
                 if "tqdm_class" in sig.parameters:
                     kwargs["tqdm_class"] = StreamlitTqdm
+                if token:
+                    kwargs["token"] = token
                 result["path"] = snapshot_download(**kwargs)
             except Exception as e:
                 result["error"] = e
@@ -828,7 +847,8 @@ def render_hf_model_card(repo_id: str, key: str, kind: str) -> None:
         label = "Re-verify" if cached else "Download now"
         btn_type = "secondary" if cached else "primary"
         if st.button(label, key=f"dl_btn_{key}", use_container_width=True, type=btn_type):
-            download_hf_model(repo_id)
+            token = (st.session_state.get("cfg_hf_token") or "").strip() or None
+            download_hf_model(repo_id, token=token)
             st.rerun()
 
 
@@ -1097,35 +1117,27 @@ def step_models() -> None:
                     key=_wk("cfg_hf_custom"),
                 )
                 st.session_state.cfg_hf_custom = custom_hf
-        q1, q2 = st.columns(2)
-        with q1:
-            quant_opts = ["none", "4bit", "8bit"]
-            quant_current = st.session_state.cfg_hf_quantize
-            if quant_current not in quant_opts:
-                quant_current = "none"
-                st.session_state.cfg_hf_quantize = quant_current
-            chosen_quant = st.selectbox(
-                "Quantization",
-                quant_opts,
-                index=quant_opts.index(quant_current),
-                help="4/8-bit uses bitsandbytes — requires CUDA.",
-                key=_wk("cfg_hf_quantize"),
-            )
-            st.session_state.cfg_hf_quantize = chosen_quant
-        with q2:
-            mnt = st.number_input(
-                "Max new tokens",
-                64,
-                4096,
-                value=int(st.session_state.cfg_hf_max_tokens),
-                step=64,
-                key=_wk("cfg_hf_max_tokens"),
-            )
-            st.session_state.cfg_hf_max_tokens = int(mnt)
+
+        # HuggingFace access token — required for gated repos (Llama 3,
+        # Gemma, Mistral Instruct, etc.). Stored in session_state only,
+        # never persisted to disk.
+        hf_token = st.text_input(
+            "HuggingFace access token (optional)",
+            value=st.session_state.cfg_hf_token,
+            type="password",
+            placeholder="hf_...",
+            help=(
+                "Required only for gated models (Llama, Gemma, Mistral, etc.). "
+                "Create one at https://huggingface.co/settings/tokens — a "
+                "read-only token is enough. Stored only in this browser session."
+            ),
+            key=_wk("cfg_hf_token"),
+        )
+        st.session_state.cfg_hf_token = (hf_token or "").strip()
 
         hf_id = _effective("cfg_hf_sel", "cfg_hf_custom") if chosen_hf else ""
         if hf_id:
-            st.caption(f"Selected HF model: **{hf_id}** · quantization: **{chosen_quant}**")
+            st.caption(f"Selected HF model: **{hf_id}**")
             render_hf_model_card(hf_id, key="hf_llm", kind="LLM")
         else:
             st.caption("_Pick a model to continue._")

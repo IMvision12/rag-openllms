@@ -73,8 +73,10 @@ class Settings(BaseSettings):
 
     # HuggingFace (local transformers pipeline)
     hf_model: str = Field(default="Qwen/Qwen2.5-1.5B-Instruct", alias="HF_MODEL")
-    hf_max_new_tokens: int = Field(default=512, alias="HF_MAX_NEW_TOKENS")
-    hf_quantize: str | None = Field(default=None, alias="HF_QUANTIZE")  # 4bit | 8bit | None
+    # Access token for gated HF repos (Llama, Gemma, Mistral, etc.). Empty
+    # string = anonymous; the UI supplies this per-session and doesn't
+    # persist it to disk.
+    hf_token: str = Field(default="", alias="HF_TOKEN")
 
 
 def load_settings() -> Settings:

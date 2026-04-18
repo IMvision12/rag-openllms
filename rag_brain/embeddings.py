@@ -25,6 +25,11 @@ def _suppress_hf_noise() -> None:
 
 def get_embeddings(settings: Settings) -> HuggingFaceEmbeddings:
     _suppress_hf_noise()
+    # Propagate HF token so gated embedding repos (rare, but possible)
+    # authenticate too. SentenceTransformer picks this up from env.
+    if settings.hf_token:
+        os.environ["HF_TOKEN"] = settings.hf_token
+        os.environ["HUGGINGFACE_HUB_TOKEN"] = settings.hf_token
     device = "cuda" if torch.cuda.is_available() else "cpu"
     return HuggingFaceEmbeddings(
         model_name=settings.embedding_model,

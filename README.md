@@ -11,7 +11,7 @@ Built as a master's project for CPSC 597 at California State University, Fullert
 - **Multiple chunking strategies** — fixed-size or embedding-based semantic (via `SemanticChunker`)
 - **Hybrid retrieval** — queries both backends, deduplicates overlapping chunks, returns top-k results
 - **Source attribution** — LLM answers cite chunk numbers for traceability
-- **Open-source LLMs only** — local inference via Ollama (Llama 3, Mistral, etc.) or HuggingFace Transformers (Qwen, Gemma, Falcon, etc.) with optional 4-bit/8-bit quantization
+- **Open-source LLMs only** — local inference via Ollama (Llama 3, Mistral, etc.) or HuggingFace Transformers (Qwen, Gemma, Falcon, etc.)
 - **GPU auto-detection** — uses CUDA for embeddings when available, falls back to CPU
 - **Evaluation framework** — retrieval metrics (Precision@k, Recall@k, MRR) and generation metrics (ROUGE-L, BERTScore)
 
@@ -196,8 +196,6 @@ All settings are read from `.env` in the project root:
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama API URL |
 | `OLLAMA_MODEL` | `llama3` | Ollama model name |
 | `HF_MODEL` | `Qwen/Qwen2.5-1.5B-Instruct` | HuggingFace model ID |
-| `HF_MAX_NEW_TOKENS` | `512` | Max tokens to generate |
-| `HF_QUANTIZE` | _(none)_ | `4bit`, `8bit`, or empty for full precision |
 
 ## Project Structure
 
@@ -224,6 +222,6 @@ rag-openllms/
 - **Neo4j** — graph database with vector index
 - **Sentence Transformers** — embedding models (MiniLM, MPNet, BGE)
 - **Ollama** — local LLM inference (Llama 3, Mistral, etc.)
-- **HuggingFace Transformers** — direct model loading (Qwen, Gemma, Falcon, etc.) with 4-bit/8-bit quantization via `ChatHuggingFace`
+- **HuggingFace Transformers** — direct model loading (Qwen, Gemma, Falcon, etc.) via `ChatHuggingFace`
 - **PyPDF / python-docx** — document processing
 - **ROUGE-score / BERTScore** — evaluation metrics
