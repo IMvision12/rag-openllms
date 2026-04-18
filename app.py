@@ -872,12 +872,17 @@ def _split_thinking(text: str) -> tuple[str, str]:
     return thinking, answer.strip()
 
 
-def _render_assistant_message(content: str) -> None:
+def _render_assistant_message(content: str, mode: str | None = None, top_score: float | None = None) -> None:
     thinking, answer = _split_thinking(content)
     if thinking:
         with st.expander("Reasoning", expanded=False):
             st.markdown(thinking)
     st.markdown(answer or "_(empty answer)_")
+    if mode == "rag":
+        st.caption(f"📄 Answered from your documents · top relevance **{top_score:.2f}**")
+    elif mode == "chat":
+        s = f" · top relevance **{top_score:.2f}**" if top_score is not None else ""
+        st.caption(f"💬 Chat mode — no document context used{s}")
 
 
 def _render_retrieved(retrieved: list[dict]) -> None:
@@ -1338,7 +1343,11 @@ def step_chat() -> None:
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             if msg["role"] == "assistant":
-                _render_assistant_message(msg["content"])
+                _render_assistant_message(
+                    msg["content"],
+                    mode=msg.get("mode"),
+                    top_score=msg.get("top_score"),
+                )
             else:
                 st.markdown(msg["content"])
             if msg.get("retrieved"):
@@ -1359,11 +1368,19 @@ def step_chat() -> None:
                         banner("error", f"Query failed: {e}")
                         out = None
                 if out is not None:
-                    _render_assistant_message(out["answer"])
+                    mode = out.get("mode")
+                    top_score = out.get("top_score")
+                    _render_assistant_message(out["answer"], mode=mode, top_score=top_score)
                     retrieved = out.get("retrieved", [])
                     _render_retrieved(retrieved)
                     st.session_state.chat_history.append(
-                        {"role": "assistant", "content": out["answer"], "retrieved": retrieved}
+                        {
+                            "role": "assistant",
+                            "content": out["answer"],
+                            "retrieved": retrieved,
+                            "mode": mode,
+                            "top_score": top_score,
+                        }
                     )
 
 

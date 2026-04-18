@@ -119,6 +119,58 @@ _RAG_SYSTEM_PROMPT = (
     "to answer, say so explicitly. Do not make up information."
 )
 
+_CHAT_SYSTEM_PROMPT = (
+    "You are a helpful assistant. Answer the user's question naturally and concisely from "
+    "your own general knowledge. Do not mention any documents, do not fabricate citations, "
+    "and keep replies conversational."
+)
+
+# Cross-encoder reranker. Unlike bi-encoder cosine similarity (which drifts
+# with query length and phrasing — short queries against long chunks hover
+# at 0.1–0.3 even for highly relevant hits), cross-encoder scores are
+# calibrated: a fixed threshold reliably separates "this chunk answers
+# the question" from "it doesn't". This is the standard production
+# approach (LlamaIndex / LangChain / Haystack all recommend it).
+#
+# bge-reranker-base is a ~280 MB multilingual model. Scores are raw
+# logits; we apply sigmoid to land in [0, 1]. Threshold 0.3 is what
+# Cohere / BGE / ZeroEntropy reranker guides recommend as a usable "good
+# enough" cutoff for relevance — sigmoid(0) = 0.5 is already "likely
+# relevant"; below 0.3 is confidently irrelevant.
+_RERANKER_MODEL = "BAAI/bge-reranker-base"
+_RERANK_SCORE_THRESHOLD = 0.3
+# Over-retrieve this many candidates from each backend before reranking.
+# The reranker is O(k) per query, so 20 is cheap and gives the reranker
+# enough recall even when the bi-encoder's top-k misses the best chunk.
+_RERANK_CANDIDATE_POOL = 20
+
+# Force Chroma to use cosine distance so similarity_search_with_score returns
+# values in [0, 2] where distance = 1 - cos_sim. Gives us a clean
+# 1 - distance → cos_sim mapping and matches Neo4jVector's native metric.
+# Older collections created without this metadata (default L2) are auto-
+# wiped in _ensure_chroma — user just re-ingests.
+_CHROMA_COLLECTION_META = {"hnsw:space": "cosine"}
+
+
+def _sigmoid(x: float) -> float:
+    """Safe scalar sigmoid (avoids overflow on large negatives)."""
+    import math
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+
+def _normalize_chroma_distance(dist: float) -> float:
+    """Chroma cosine distance (= 1 - cos_sim) → cos_sim, clamped to [0, 1]."""
+    return max(0.0, min(1.0, 1.0 - float(dist)))
+
+
+def _normalize_neo4j_score(sim: float) -> float:
+    """Neo4j returns cosine similarity directly; clamp defensively."""
+    return max(0.0, min(1.0, float(sim)))
+
 
 class RAGPipeline:
     """End-to-end RAG with support for Chroma, Neo4j, or both simultaneously."""
@@ -130,11 +182,36 @@ class RAGPipeline:
         self._neo4j_store: Neo4jVector | None = None
         self._neo4j_graph: Neo4jGraph | None = None
         self._llm = None
+        self._reranker = None
+        self._reranker_load_failed = False
 
     def _ensure_llm(self):
         if self._llm is None:
             self._llm = _build_llm(self.settings)
         return self._llm
+
+    def _get_reranker(self):
+        """Lazy-load the cross-encoder reranker. Returns None if loading
+        fails (e.g. no network on first use, OOM); _retrieve_scored falls
+        back to bi-encoder cosine so the pipeline still works."""
+        if self._reranker is not None or self._reranker_load_failed:
+            return self._reranker
+        try:
+            import torch
+            from sentence_transformers import CrossEncoder
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            token = (self.settings.hf_token or None)
+            kwargs: dict[str, Any] = {"max_length": 512, "device": device}
+            # sentence-transformers accepts `token=` for gated repos; wrap
+            # in try/except because older versions use `use_auth_token`.
+            try:
+                self._reranker = CrossEncoder(_RERANKER_MODEL, token=token, **kwargs)
+            except TypeError:
+                self._reranker = CrossEncoder(_RERANKER_MODEL, use_auth_token=token, **kwargs)
+        except Exception:
+            self._reranker_load_failed = True
+            self._reranker = None
+        return self._reranker
 
     @property
     def _use_chroma(self) -> bool:
@@ -248,12 +325,14 @@ class RAGPipeline:
                 embedding=self._embeddings,
                 persist_directory=str(persist),
                 collection_name=self.settings.chroma_collection,
+                collection_metadata=_CHROMA_COLLECTION_META,
             )
         else:
             store = Chroma(
                 persist_directory=str(persist),
                 embedding_function=self._embeddings,
                 collection_name=self.settings.chroma_collection,
+                collection_metadata=_CHROMA_COLLECTION_META,
             )
             store.add_documents(chunks)
             self._chroma_store = store
@@ -285,13 +364,22 @@ class RAGPipeline:
                 persist_directory=str(s.chroma_persist_dir),
                 embedding_function=self._embeddings,
                 collection_name=s.chroma_collection,
+                collection_metadata=_CHROMA_COLLECTION_META,
             )
             # Defensive: probe the collection. If chromadb's SQLite + on-disk
             # state is inconsistent (stale UUID cached, orphan subdirs, etc.),
-            # wipe and re-open cleanly.
+            # OR the collection was created with a different hnsw:space than
+            # what we need now (older builds defaulted to L2, which broke
+            # our relevance scoring), wipe and re-open cleanly.
+            needs_rebuild = False
             try:
                 self._chroma_store._collection.count()
+                existing_meta = self._chroma_store._collection.metadata or {}
+                if existing_meta.get("hnsw:space") != _CHROMA_COLLECTION_META["hnsw:space"]:
+                    needs_rebuild = True
             except Exception:
+                needs_rebuild = True
+            if needs_rebuild:
                 self._release_chroma()
                 if s.chroma_persist_dir.exists():
                     try:
@@ -303,6 +391,7 @@ class RAGPipeline:
                     persist_directory=str(s.chroma_persist_dir),
                     embedding_function=self._embeddings,
                     collection_name=s.chroma_collection,
+                    collection_metadata=_CHROMA_COLLECTION_META,
                 )
         return self._chroma_store
 
@@ -323,13 +412,13 @@ class RAGPipeline:
 
     # ── Retrieval ──────────────────────────────────────────────────────
 
-    def _retrieve(self, question: str) -> list[Document]:
-        """Retrieve from configured backends, merge and deduplicate.
+    def _retrieve_candidates(self, question: str, pool: int) -> list[Document]:
+        """Retrieve up to `pool` unscored candidates per backend, dedupe.
 
-        If one backend in a hybrid setup fails (e.g. Neo4j unreachable), we
-        fall back to the other and record the error on self.last_query_warnings.
+        This is the first stage of the two-stage retrieve-then-rerank
+        pipeline. We pull more than top_k here so the reranker has recall
+        room; it will pick the truly relevant ones.
         """
-        k = self.settings.top_k
         all_docs: list[Document] = []
         self.last_query_warnings: list[str] = []
         backends_tried = int(self._use_chroma) + int(self._use_neo4j)
@@ -337,7 +426,7 @@ class RAGPipeline:
         if self._use_chroma:
             try:
                 store = self._ensure_chroma()
-                all_docs.extend(store.similarity_search(question, k=k))
+                all_docs.extend(store.similarity_search(question, k=pool))
             except Exception as e:
                 if backends_tried > 1:
                     self.last_query_warnings.append(f"Chroma retrieval failed: {e}")
@@ -347,41 +436,145 @@ class RAGPipeline:
         if self._use_neo4j:
             try:
                 store = self._ensure_neo4j()
-                all_docs.extend(store.similarity_search(question, k=k))
+                all_docs.extend(store.similarity_search(question, k=pool))
             except Exception as e:
                 if backends_tried > 1:
                     self.last_query_warnings.append(f"Neo4j retrieval failed: {e}")
                 else:
                     raise
 
-        deduped = _deduplicate_docs(all_docs)
-        # When using both backends we retrieve 2*k candidates; trim back to top_k
-        return deduped[: k]
+        return _deduplicate_docs(all_docs)
+
+    def _retrieve_scored_cosine(self, question: str) -> list[tuple[Document, float]]:
+        """Bi-encoder cosine fallback: used when the reranker is unavailable.
+
+        Scores are uncalibrated — don't expect the threshold tuned for the
+        cross-encoder to behave well here. Better than nothing.
+        """
+        k = self.settings.top_k
+        scored: list[tuple[Document, float]] = []
+        self.last_query_warnings: list[str] = []
+        backends_tried = int(self._use_chroma) + int(self._use_neo4j)
+
+        if self._use_chroma:
+            try:
+                store = self._ensure_chroma()
+                for d, dist in store.similarity_search_with_score(question, k=k):
+                    scored.append((d, _normalize_chroma_distance(dist)))
+            except Exception as e:
+                if backends_tried > 1:
+                    self.last_query_warnings.append(f"Chroma retrieval failed: {e}")
+                else:
+                    raise
+        if self._use_neo4j:
+            try:
+                store = self._ensure_neo4j()
+                for d, sim in store.similarity_search_with_score(question, k=k):
+                    scored.append((d, _normalize_neo4j_score(sim)))
+            except Exception as e:
+                if backends_tried > 1:
+                    self.last_query_warnings.append(f"Neo4j retrieval failed: {e}")
+                else:
+                    raise
+        best: dict[str, tuple[Document, float]] = {}
+        for d, s in scored:
+            key = d.page_content.strip()
+            if key not in best or best[key][1] < s:
+                best[key] = (d, float(s))
+        return sorted(best.values(), key=lambda t: -t[1])[:k]
+
+    def _retrieve_scored(self, question: str) -> list[tuple[Document, float]]:
+        """Two-stage retrieve-and-rerank returning (doc, relevance) pairs.
+
+        Stage 1: pull `_RERANK_CANDIDATE_POOL` candidates per backend using
+        the bi-encoder (Chroma / Neo4j), dedupe by chunk text.
+        Stage 2: score each (query, chunk) pair with a cross-encoder —
+        scores are calibrated, so the threshold in `query()` actually
+        means "relevant" rather than "lexically similar to long text".
+
+        Falls back to uncalibrated cosine if the reranker can't load.
+        """
+        k_return = self.settings.top_k
+        candidates = self._retrieve_candidates(question, _RERANK_CANDIDATE_POOL)
+        if not candidates:
+            return []
+
+        reranker = self._get_reranker()
+        if reranker is None:
+            return self._retrieve_scored_cosine(question)
+
+        pairs = [(question, d.page_content) for d in candidates]
+        try:
+            raw = reranker.predict(pairs, show_progress_bar=False)
+            # raw is numpy array or list of floats; apply sigmoid → [0, 1]
+            scores = [_sigmoid(float(s)) for s in raw]
+        except Exception:
+            # Reranker call failed at runtime (CUDA OOM, corrupt weights,
+            # etc.) — one-shot fall back rather than crashing the query.
+            self._reranker_load_failed = True
+            self._reranker = None
+            return self._retrieve_scored_cosine(question)
+
+        scored = sorted(zip(candidates, scores), key=lambda t: -t[1])
+        return scored[:k_return]
+
+    def _retrieve(self, question: str) -> list[Document]:
+        """Backward-compatible retrieval without scores."""
+        return [d for d, _ in self._retrieve_scored(question)]
 
     # ── Query ──────────────────────────────────────────────────────────
 
     def query(self, question: str) -> dict[str, Any]:
-        """Run retrieval + generation. Returns answer and retrieved chunks."""
-        docs = self._retrieve(question)
-        if not docs:
-            import sys
-            print("Warning: no documents retrieved. Did you ingest files first?", file=sys.stderr)
-        context = _format_context(docs)
+        """Retrieve + rerank + threshold on calibrated reranker score.
 
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", _RAG_SYSTEM_PROMPT),
-                ("human", "Context:\n{context}\n\nQuestion:\n{question}"),
-            ]
-        )
+        Standard industry pattern (LangChain / LlamaIndex / Haystack all
+        recommend it): cross-encoder scores are calibrated, so a fixed
+        threshold on the top reranked chunk reliably tells us whether the
+        question is actually answerable from the docs.
 
-        answer = (prompt | self._ensure_llm() | StrOutputParser()).invoke(
-            {"context": context, "question": question}
-        )
+        - top_score >= _RERANK_SCORE_THRESHOLD → RAG mode (strict prompt,
+          cite chunk numbers)
+        - top_score <  _RERANK_SCORE_THRESHOLD → chat mode (answer from
+          general knowledge, no citations, no doc context passed to LLM)
+        """
+        scored = self._retrieve_scored(question)
+        top_score = scored[0][1] if scored else 0.0
+        docs = [d for d, _ in scored]
+        use_rag = bool(docs) and top_score >= _RERANK_SCORE_THRESHOLD
+
+        if use_rag:
+            prompt = ChatPromptTemplate.from_messages(
+                [
+                    ("system", _RAG_SYSTEM_PROMPT),
+                    ("human", "Context:\n{context}\n\nQuestion:\n{question}"),
+                ]
+            )
+            answer = (prompt | self._ensure_llm() | StrOutputParser()).invoke(
+                {"context": _format_context(docs), "question": question}
+            )
+            mode = "rag"
+            retrieved_docs = docs
+        else:
+            prompt = ChatPromptTemplate.from_messages(
+                [
+                    ("system", _CHAT_SYSTEM_PROMPT),
+                    ("human", "{question}"),
+                ]
+            )
+            answer = (prompt | self._ensure_llm() | StrOutputParser()).invoke(
+                {"question": question}
+            )
+            mode = "chat"
+            retrieved_docs = []
+
         return {
             "answer": answer,
+            "mode": mode,
+            "top_score": top_score,
+            "reranker_used": self._reranker is not None,
             "retrieved": [
-                {"content": d.page_content, "metadata": dict(d.metadata or {})} for d in docs
+                {"content": d.page_content, "metadata": dict(d.metadata or {})}
+                for d in retrieved_docs
             ],
         }
 
