@@ -16,6 +16,19 @@ from rag_brain.embeddings import get_embeddings
 from rag_brain.ingestion import load_documents, split_documents
 
 
+def _rmtree_windows_safe(path: Path) -> None:
+    """rmtree with retries — Windows file handles can release a beat later."""
+    import time
+    for attempt in range(8):
+        try:
+            shutil.rmtree(path)
+            return
+        except (PermissionError, OSError):
+            if attempt == 7:
+                raise
+            time.sleep(0.25 * (attempt + 1))
+
+
 def _neo4j_conn_kwargs(settings: Settings) -> dict[str, Any]:
     out: dict[str, Any] = {
         "url": settings.neo4j_uri,
@@ -81,6 +94,7 @@ def _build_hf_llm(settings: Settings):
         max_new_tokens=settings.hf_max_new_tokens,
         temperature=0.1,
         do_sample=True,
+        return_full_text=False,
     )
     llm = HuggingFacePipeline(pipeline=pipe)
     return ChatHuggingFace(llm=llm)
@@ -143,10 +157,23 @@ class RAGPipeline:
 
         return len(chunks)
 
+    def _release_chroma(self) -> None:
+        """Release file locks held by the Chroma client (needed on Windows before rmtree)."""
+        self._chroma_store = None
+        try:
+            from chromadb.api.client import SharedSystemClient
+            SharedSystemClient.clear_system_cache()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+
     def _ingest_chroma(self, chunks: list[Document], *, recreate: bool) -> None:
         persist = self.settings.chroma_persist_dir
-        if recreate and persist.exists():
-            shutil.rmtree(persist)
+        if recreate:
+            self._release_chroma()
+            if persist.exists():
+                _rmtree_windows_safe(persist)
         persist.mkdir(parents=True, exist_ok=True)
         if recreate:
             self._chroma_store = Chroma.from_documents(

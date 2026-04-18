@@ -29,3 +29,6 @@ pydantic-settings>=2.0.0
 # Evaluation (optional — install for metrics)
 rouge-score>=0.1.2
 bert-score>=0.3.13
+
+# UI
+streamlit>=1.30.0
