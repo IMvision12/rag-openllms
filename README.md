@@ -141,6 +141,20 @@ python -m rag_brain --backend both --query "What are the key findings?"
 python -m rag_brain --backend both --query "What are the key findings?" --show-chunks
 ```
 
+### Explore the knowledge graph
+
+After ingesting with `neo4j` or `both`, browse the extracted entity-relation graph in **Neo4j Browser**:
+
+🔗 **[http://localhost:7474](http://localhost:7474)** (default Neo4j HTTP port — same machine as the bolt URL in `.env`)
+
+Log in with your `NEO4J_USERNAME` / `NEO4J_PASSWORD`, then paste this into the query bar to see the whole graph with all connections:
+
+```cypher
+MATCH (n)-[r]-(m) RETURN n, r, m
+```
+
+Drag nodes to rearrange, double-click to expand neighbors, scroll to zoom. For larger graphs add `LIMIT 500` at the end to keep the renderer snappy.
+
 ### Evaluate
 
 Use the evaluation module programmatically:
