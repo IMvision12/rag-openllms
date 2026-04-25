@@ -45,7 +45,6 @@ class Settings(BaseSettings):
     neo4j_user: str = Field(default="neo4j", alias="NEO4J_USERNAME")
     neo4j_password: str = Field(default="", alias="NEO4J_PASSWORD")
     neo4j_database: str | None = Field(default=None, alias="NEO4J_DATABASE")
-    neo4j_vector_index: str = Field(default="rag_chunk_vectors", alias="NEO4J_VECTOR_INDEX")
 
     # --- Embeddings (local sentence-transformers) ---
     embedding_model: str = Field(
@@ -77,6 +76,28 @@ class Settings(BaseSettings):
     # string = anonymous; the UI supplies this per-session and doesn't
     # persist it to disk.
     hf_token: str = Field(default="", alias="HF_TOKEN")
+
+    # --- Graph-extraction LLM (for Neo4j knowledge-graph building) ---
+    # Entity/relation extraction calls an LLM per chunk — the main answer
+    # LLM is often a small local model too slow for this. A cloud API LLM
+    # is 10–100× faster and runs many chunks in parallel cheaply. "none"
+    # skips extraction entirely (Neo4j stores vector-only flat chunks).
+    graph_llm_provider: str = Field(
+        default="none", alias="GRAPH_LLM_PROVIDER"
+    )  # none | anthropic | openai | gemini | openrouter
+    graph_llm_model: str = Field(default="", alias="GRAPH_LLM_MODEL")
+    graph_llm_api_key: str = Field(default="", alias="GRAPH_LLM_API_KEY")
+    # Parallel chunk workers for extraction. Cloud APIs tolerate 4–8 concurrent
+    # requests; raise carefully to avoid rate limits.
+    graph_llm_workers: int = Field(default=4, alias="GRAPH_LLM_WORKERS")
+
+    # --- Graph retrieval (neo4j backend uses pure graph traversal) ---
+    # Hop depth for entity expansion at query time. 0 = matched entities only;
+    # 1 = include direct neighbors; clamped to [0, 3] in the Cypher.
+    graph_hops: int = Field(default=1, alias="GRAPH_HOPS")
+    # Max seed entities to expand from per query (prevents huge subgraphs
+    # when the question is broad and many entities match).
+    graph_max_entities: int = Field(default=10, alias="GRAPH_MAX_ENTITIES")
 
 
 def load_settings() -> Settings:

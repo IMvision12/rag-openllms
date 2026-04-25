@@ -8,7 +8,7 @@ from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.vectorstores import Chroma
-from langchain_neo4j import Neo4jGraph, Neo4jVector
+from langchain_neo4j import Neo4jGraph
 from langchain_ollama import ChatOllama
 
 from rag_brain.config import RetrievalBackend, Settings, load_settings
@@ -146,7 +146,8 @@ _RERANK_CANDIDATE_POOL = 20
 
 # Force Chroma to use cosine distance so similarity_search_with_score returns
 # values in [0, 2] where distance = 1 - cos_sim. Gives us a clean
-# 1 - distance → cos_sim mapping and matches Neo4jVector's native metric.
+# 1 - distance → cos_sim mapping. Neo4j now uses pure graph retrieval, so
+# this only affects the Chroma path.
 # Older collections created without this metadata (default L2) are auto-
 # wiped in _ensure_chroma — user just re-ingests.
 _CHROMA_COLLECTION_META = {"hnsw:space": "cosine"}
@@ -167,21 +168,33 @@ def _normalize_chroma_distance(dist: float) -> float:
     return max(0.0, min(1.0, 1.0 - float(dist)))
 
 
-def _normalize_neo4j_score(sim: float) -> float:
-    """Neo4j returns cosine similarity directly; clamp defensively."""
-    return max(0.0, min(1.0, float(sim)))
+_QUERY_ENTITY_PROMPT = (
+    "You extract entity mentions for a knowledge-graph search. "
+    "Given the user's question, return a JSON array of strings: the named "
+    "entities, proper nouns, and concrete concepts likely to appear as "
+    "nodes in a knowledge graph. Lowercase common words and stopwords are "
+    "useless — skip them. Return ONLY the JSON array, no prose, no "
+    "markdown fencing. If no entities, return []."
+)
 
 
 class RAGPipeline:
-    """End-to-end RAG with support for Chroma, Neo4j, or both simultaneously."""
+    """End-to-end RAG with support for Chroma, Neo4j, or both simultaneously.
+
+    Backends:
+      - vector: Chroma (vector similarity)
+      - neo4j:  pure knowledge-graph retrieval (entity extract → match →
+                hop expand → fetch source chunks via :MENTIONS)
+      - both:   union of the two, deduplicated and reranked together
+    """
 
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or load_settings()
         self._embeddings = get_embeddings(self.settings)
         self._chroma_store: Chroma | None = None
-        self._neo4j_store: Neo4jVector | None = None
         self._neo4j_graph: Neo4jGraph | None = None
         self._llm = None
+        self._graph_query_llm = None
         self._reranker = None
         self._reranker_load_failed = False
 
@@ -338,21 +351,153 @@ class RAGPipeline:
             self._chroma_store = store
 
     def _ingest_neo4j(self, chunks: list[Document], *, recreate: bool) -> None:
-        if not self.settings.neo4j_password:
+        """Pure-graph ingest. No vector index — retrieval traverses the
+        entity graph at query time via Cypher.
+
+        `LLMGraphTransformer` extracts (entity, relation, entity) triples
+        from each chunk; `add_graph_documents(..., include_source=True)`
+        writes them along with `:Document` nodes that retain the full
+        chunk text and link to every entity they mention via `[:MENTIONS]`.
+        Those `:Document` nodes are what `_graph_retrieve` returns.
+
+        Requires a configured graph-extraction LLM — without it the graph
+        would be empty and the backend would return nothing at query time.
+        """
+        s = self.settings
+        if not s.neo4j_password:
             raise ValueError("NEO4J_PASSWORD is required for neo4j backend.")
-        conn = _neo4j_conn_kwargs(self.settings)
-        self._neo4j_graph = Neo4jGraph(**conn, refresh_schema=False)
-        if recreate:
-            self._neo4j_store = Neo4jVector.from_documents(
-                chunks,
-                self._embeddings,
-                index_name=self.settings.neo4j_vector_index,
-                **conn,
+        if (s.graph_llm_provider or "none").lower() == "none":
+            raise ValueError(
+                "neo4j backend requires graph extraction. Set GRAPH_LLM_PROVIDER, "
+                "GRAPH_LLM_MODEL, and GRAPH_LLM_API_KEY in .env."
             )
-        else:
-            store = self._ensure_neo4j()
-            store.add_documents(chunks)
-            self._neo4j_store = store
+
+        self._neo4j_graph = Neo4jGraph(**_neo4j_conn_kwargs(s), refresh_schema=False)
+
+        if recreate:
+            # Wipe everything: prior entities, source docs, leftover chunks.
+            self._neo4j_graph.query("MATCH (n) DETACH DELETE n")
+
+        extracted = self._extract_graph(chunks)
+        if extracted == 0:
+            warnings = getattr(self, "last_ingest_warnings", [])
+            detail = "; ".join(warnings) if warnings else "no graph documents produced"
+            raise RuntimeError(f"Graph extraction failed: {detail}")
+
+    def _build_graph_llm(self):
+        """Build the LLM used for knowledge-graph extraction.
+
+        Keeps extraction decoupled from the answer LLM: resumes and papers
+        tend to need a strong, fast model for relation extraction (cloud
+        APIs), while the answer LLM can still be a small local model.
+
+        Returns None if provider is 'none' or config is incomplete.
+        """
+        s = self.settings
+        provider = (s.graph_llm_provider or "none").lower()
+        if provider == "none":
+            return None
+        model = (s.graph_llm_model or "").strip()
+        key = (s.graph_llm_api_key or "").strip()
+        if not model or not key:
+            return None
+
+        if provider == "anthropic":
+            from langchain_anthropic import ChatAnthropic
+            return ChatAnthropic(model=model, api_key=key, temperature=0)
+        if provider == "openai":
+            from langchain_openai import ChatOpenAI
+            return ChatOpenAI(model=model, api_key=key, temperature=0)
+        if provider == "gemini":
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            return ChatGoogleGenerativeAI(model=model, google_api_key=key, temperature=0)
+        if provider == "openrouter":
+            # OpenRouter exposes an OpenAI-compatible API.
+            from langchain_openai import ChatOpenAI
+            return ChatOpenAI(
+                model=model,
+                api_key=key,
+                base_url="https://openrouter.ai/api/v1",
+                temperature=0,
+            )
+        raise ValueError(f"Unknown graph_llm_provider: {provider!r}")
+
+    def _extract_graph(self, chunks: list[Document]) -> int:
+        """Run LLMGraphTransformer over chunks → entities + relationships.
+
+        Returns the count of chunks successfully written to the graph.
+        Zero means the caller should treat the ingest as a hard failure
+        (pure-graph backend has nothing to retrieve from otherwise).
+
+        Uses the dedicated graph-extraction LLM. Chunks run concurrently
+        via a thread pool to hide per-request latency (cloud APIs handle
+        this trivially; local models bottleneck on the single weight copy).
+        """
+        try:
+            from langchain_experimental.graph_transformers import LLMGraphTransformer
+        except Exception as e:
+            if hasattr(self, "last_ingest_warnings"):
+                self.last_ingest_warnings.append(
+                    f"Graph extraction skipped (langchain-experimental missing): {e}"
+                )
+            return 0
+
+        try:
+            llm = self._build_graph_llm()
+        except Exception as e:
+            if hasattr(self, "last_ingest_warnings"):
+                self.last_ingest_warnings.append(f"Graph LLM init failed: {e}")
+            return 0
+        if llm is None:
+            if hasattr(self, "last_ingest_warnings"):
+                self.last_ingest_warnings.append(
+                    "Graph extraction skipped — no graph-extraction LLM configured."
+                )
+            return 0
+
+        # `ignore_tool_usage=True` forces prompt-based extraction, which
+        # works with any chat model. For tool-calling-capable models
+        # (Anthropic/OpenAI/Gemini) the default path is faster + cleaner.
+        try:
+            transformer = LLMGraphTransformer(llm=llm)
+        except TypeError:
+            transformer = LLMGraphTransformer(llm=llm, ignore_tool_usage=True)
+
+        # Fan out chunks across a thread pool. LLMGraphTransformer exposes
+        # `process_response` for per-doc processing; we call it directly
+        # so we can parallelize without depending on langchain's async stack.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        workers = max(1, int(self.settings.graph_llm_workers or 4))
+        graph_docs = []
+        errors: list[str] = []
+
+        def _run_one(doc):
+            return transformer.process_response(doc)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_run_one, c): c for c in chunks}
+            for fut in as_completed(futures):
+                try:
+                    graph_docs.append(fut.result())
+                except Exception as e:
+                    errors.append(str(e))
+
+        if errors and hasattr(self, "last_ingest_warnings"):
+            self.last_ingest_warnings.append(
+                f"Graph extraction had {len(errors)} chunk failure(s); first: {errors[0]}"
+            )
+        if not graph_docs:
+            return 0
+
+        # `baseEntityLabel=True` adds a shared `:__Entity__` label so you
+        # can query across all entity types; `include_source=True` creates
+        # `:Document` nodes linked to each entity via `[:MENTIONS]`.
+        self._neo4j_graph.add_graph_documents(
+            graph_docs,
+            baseEntityLabel=True,
+            include_source=True,
+        )
+        return len(graph_docs)
 
     # ── Loading existing stores ────────────────────────────────────────
 
@@ -395,20 +540,123 @@ class RAGPipeline:
                 )
         return self._chroma_store
 
-    def _ensure_neo4j(self) -> Neo4jVector:
-        if self._neo4j_store is None:
+    def _ensure_neo4j_graph(self) -> Neo4jGraph:
+        if self._neo4j_graph is None:
             s = self.settings
             if not s.neo4j_password:
                 raise ValueError("NEO4J_PASSWORD is required for neo4j backend.")
             self._neo4j_graph = Neo4jGraph(
                 **_neo4j_conn_kwargs(s), refresh_schema=False
             )
-            self._neo4j_store = Neo4jVector.from_existing_index(
-                self._embeddings,
-                index_name=s.neo4j_vector_index,
-                **_neo4j_conn_kwargs(s),
+        return self._neo4j_graph
+
+    # ── Graph retrieval (pure graph; no vector index involved) ─────────
+
+    def _ensure_graph_query_llm(self):
+        """Lazy-build the LLM used to extract entities from a question.
+        Reuses the same provider config as graph ingest extraction."""
+        if self._graph_query_llm is None:
+            self._graph_query_llm = self._build_graph_llm()
+        return self._graph_query_llm
+
+    def _extract_query_entities(self, question: str) -> list[str]:
+        """Ask the graph LLM for a JSON list of entity mentions in `question`.
+
+        Returns [] if the LLM is unavailable or its output can't be parsed —
+        callers treat that as 'no graph hits' and fall through to chat mode
+        (or, in `both` backend, vector results carry the query).
+        """
+        import json as _json
+        import re as _re
+
+        llm = self._ensure_graph_query_llm()
+        if llm is None:
+            return []
+        prompt = ChatPromptTemplate.from_messages(
+            [("system", _QUERY_ENTITY_PROMPT), ("human", "{question}")]
+        )
+        try:
+            raw = (prompt | llm | StrOutputParser()).invoke({"question": question})
+        except Exception:
+            return []
+        text = (raw or "").strip()
+        # Strip ```json ... ``` fences if the model added them.
+        if text.startswith("```"):
+            text = _re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=_re.MULTILINE).strip()
+        # Try strict JSON first; fall back to first [...] block.
+        items: list = []
+        try:
+            items = _json.loads(text)
+        except Exception:
+            m = _re.search(r"\[.*?\]", text, flags=_re.DOTALL)
+            if m:
+                try:
+                    items = _json.loads(m.group(0))
+                except Exception:
+                    items = []
+        if not isinstance(items, list):
+            return []
+        out: list[str] = []
+        for it in items:
+            s = str(it).strip()
+            if s:
+                out.append(s)
+        return out
+
+    def _graph_retrieve(self, question: str, pool: int) -> list[Document]:
+        """Pure graph retrieval.
+
+        1. Extract entity terms from the question.
+        2. Match `:__Entity__` nodes whose `id` substring-matches a term.
+        3. Expand `graph_hops` away through any relationship.
+        4. Return the source `:Document` chunk text linked via `[:MENTIONS]`.
+
+        No vector similarity anywhere in this path. Recall depends entirely
+        on whether the question's entities exist in the graph — that's the
+        intended tradeoff for this backend.
+        """
+        terms = self._extract_query_entities(question)
+        if not terms:
+            return []
+
+        graph = self._ensure_neo4j_graph()
+        # Clamp hops to a sane literal range — Cypher requires variable-
+        # length path bounds to be literals, so we format it into the query
+        # only after validating.
+        hops = max(0, min(int(self.settings.graph_hops or 0), 3))
+        max_entities = max(1, int(self.settings.graph_max_entities or 10))
+
+        cypher = f"""
+        UNWIND $terms AS term
+        MATCH (e:__Entity__)
+        WHERE toLower(e.id) CONTAINS toLower(term)
+        WITH e, count(*) AS hits
+        ORDER BY hits DESC
+        LIMIT $max_entities
+        WITH collect(e) AS seeds
+        UNWIND seeds AS m
+        OPTIONAL MATCH (m)-[*0..{hops}]-(n:__Entity__)
+        WITH collect(DISTINCT m) + collect(DISTINCT n) AS allEntities
+        UNWIND allEntities AS ent
+        MATCH (ent)<-[:MENTIONS]-(d:Document)
+        RETURN DISTINCT d.text AS text,
+                        coalesce(d.source, '?') AS source
+        LIMIT $pool
+        """
+        try:
+            rows = graph.query(
+                cypher,
+                params={"terms": terms, "max_entities": max_entities, "pool": pool},
             )
-        return self._neo4j_store
+        except Exception:
+            return []
+        out: list[Document] = []
+        for r in rows:
+            text = r.get("text")
+            if not text:
+                continue
+            out.append(Document(page_content=text, metadata={"source": r.get("source") or "?"}))
+        return out
 
     # ── Retrieval ──────────────────────────────────────────────────────
 
@@ -435,11 +683,10 @@ class RAGPipeline:
 
         if self._use_neo4j:
             try:
-                store = self._ensure_neo4j()
-                all_docs.extend(store.similarity_search(question, k=pool))
+                all_docs.extend(self._graph_retrieve(question, pool))
             except Exception as e:
                 if backends_tried > 1:
-                    self.last_query_warnings.append(f"Neo4j retrieval failed: {e}")
+                    self.last_query_warnings.append(f"Neo4j graph retrieval failed: {e}")
                 else:
                     raise
 
@@ -468,12 +715,15 @@ class RAGPipeline:
                     raise
         if self._use_neo4j:
             try:
-                store = self._ensure_neo4j()
-                for d, sim in store.similarity_search_with_score(question, k=k):
-                    scored.append((d, _normalize_neo4j_score(sim)))
+                # Pure graph hits have no native cosine score. When the
+                # cross-encoder reranker is unavailable we treat any chunk
+                # whose entity matched as presumed-relevant (score 1.0) so
+                # it isn't filtered out by the threshold gate downstream.
+                for d in self._graph_retrieve(question, k):
+                    scored.append((d, 1.0))
             except Exception as e:
                 if backends_tried > 1:
-                    self.last_query_warnings.append(f"Neo4j retrieval failed: {e}")
+                    self.last_query_warnings.append(f"Neo4j graph retrieval failed: {e}")
                 else:
                     raise
         best: dict[str, tuple[Document, float]] = {}
@@ -597,7 +847,7 @@ def run_cli() -> None:
         "--backend",
         choices=["vector", "neo4j", "both"],
         default=os.environ.get("RAG_BACKEND", "both"),
-        help="vector = Chroma; neo4j = Neo4jVector; both = hybrid retrieval from Chroma + Neo4j.",
+        help="vector = Chroma; neo4j = pure knowledge-graph retrieval; both = hybrid (Chroma vector + Neo4j graph).",
     )
     parser.add_argument(
         "--ingest",

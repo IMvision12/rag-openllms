@@ -84,6 +84,12 @@ _DEFAULT_CFG: dict = {
     "cfg_hf_sel": None,           # user picks when provider=huggingface
     "cfg_hf_custom": "",
     "cfg_hf_token": "",           # optional, required for gated HF models
+    # Graph-extraction LLM (only relevant when backend includes Neo4j).
+    # "none" = skip entity/relation extraction; Neo4j stores only flat
+    # Chunk nodes with embeddings (disconnected graph).
+    "cfg_graph_llm_provider": "none",  # none | anthropic | openai | gemini | openrouter
+    "cfg_graph_llm_model": "",
+    "cfg_graph_llm_api_key": "",
 }
 
 
@@ -415,6 +421,9 @@ def current_config() -> dict:
         "ollama_model": _effective("cfg_ollama_sel", "cfg_ollama_custom"),
         "hf_model": _effective("cfg_hf_sel", "cfg_hf_custom"),
         "hf_token": (st.session_state.cfg_hf_token or "").strip(),
+        "graph_llm_provider": (st.session_state.cfg_graph_llm_provider or "none"),
+        "graph_llm_model": (st.session_state.cfg_graph_llm_model or "").strip(),
+        "graph_llm_api_key": (st.session_state.cfg_graph_llm_api_key or "").strip(),
     }
 
 
@@ -446,6 +455,12 @@ def _pipe_matches_ui(pipe: RAGPipeline, c: dict) -> bool:
     if s.llm_provider.lower() == "ollama" and s.ollama_model != (c.get("ollama_model") or ""):
         return False
     if s.llm_provider.lower() == "huggingface" and s.hf_model != (c.get("hf_model") or ""):
+        return False
+    if (s.graph_llm_provider or "none").lower() != (c.get("graph_llm_provider") or "none").lower():
+        return False
+    if (s.graph_llm_model or "") != (c.get("graph_llm_model") or ""):
+        return False
+    if (s.graph_llm_api_key or "") != (c.get("graph_llm_api_key") or ""):
         return False
     return True
 
@@ -542,6 +557,9 @@ def build_pipeline() -> RAGPipeline:
         "ollama_model": c["ollama_model"] or "",
         "hf_model": c["hf_model"] or "",
         "hf_token": c.get("hf_token") or "",
+        "graph_llm_provider": (c.get("graph_llm_provider") or "none"),
+        "graph_llm_model": c.get("graph_llm_model") or "",
+        "graph_llm_api_key": c.get("graph_llm_api_key") or "",
     })
     settings = Settings(**data)
     return RAGPipeline(settings)
@@ -969,7 +987,7 @@ def step_retrieval() -> None:
         index=_b_idx,
         horizontal=True,
         label_visibility="collapsed",
-        help="vector = Chroma only (no external server) · both = Chroma + Neo4j · neo4j = Neo4jVector only",
+        help="vector = Chroma only (no external server) · both = Chroma + Neo4j graph · neo4j = pure knowledge-graph retrieval",
         key=_wk("cfg_backend"),
     )
     st.session_state.cfg_backend = chosen_backend
@@ -1146,6 +1164,116 @@ def step_models() -> None:
             render_hf_model_card(hf_id, key="hf_llm", kind="LLM")
         else:
             st.caption("_Pick a model to continue._")
+
+    # ─── Graph-extraction LLM (only when Neo4j is in the backend) ─────
+    if st.session_state.cfg_backend in ("neo4j", "both"):
+        st.markdown("")
+        st.markdown("### Graph-extraction LLM")
+        st.markdown(
+            '<span class="muted">Neo4j\'s knowledge graph is built by calling an LLM on every chunk '
+            'to extract entities and relationships. A fast cloud API (Anthropic/OpenAI/Gemini) '
+            'is strongly recommended — local models take minutes per document.</span>',
+            unsafe_allow_html=True,
+        )
+
+        GRAPH_PROVIDERS = ["none", "anthropic", "openai", "gemini", "openrouter"]
+        GRAPH_MODEL_PRESETS: dict[str, list[str]] = {
+            "anthropic": [
+                "claude-haiku-4-5-20251001",
+                "claude-sonnet-4-6",
+                "claude-opus-4-7",
+                "Custom…",
+            ],
+            "openai": [
+                "gpt-4o-mini",
+                "gpt-4o",
+                "gpt-4.1-mini",
+                "Custom…",
+            ],
+            "gemini": [
+                "gemini-2.0-flash",
+                "gemini-2.5-flash",
+                "gemini-2.5-pro",
+                "Custom…",
+            ],
+            "openrouter": [
+                "anthropic/claude-haiku-4-5",
+                "openai/gpt-4o-mini",
+                "google/gemini-2.0-flash",
+                "meta-llama/llama-3.3-70b-instruct",
+                "Custom…",
+            ],
+        }
+        PROVIDER_HELP = {
+            "none": "Skip extraction. Neo4j stores only flat :Chunk nodes (disconnected graph, vector search still works).",
+            "anthropic": "Claude API. Get a key at console.anthropic.com.",
+            "openai": "OpenAI API. Get a key at platform.openai.com.",
+            "gemini": "Google AI Studio. Get a key at aistudio.google.com/apikey.",
+            "openrouter": "Unified API for many providers. Get a key at openrouter.ai.",
+        }
+
+        gp_current = st.session_state.cfg_graph_llm_provider or "none"
+        if gp_current not in GRAPH_PROVIDERS:
+            gp_current = "none"
+        chosen_gp = st.radio(
+            "Provider",
+            GRAPH_PROVIDERS,
+            index=GRAPH_PROVIDERS.index(gp_current),
+            horizontal=True,
+            key=_wk("cfg_graph_llm_provider"),
+            help="Used only for building the knowledge graph. Answer generation still uses the LLM above.",
+        )
+        st.session_state.cfg_graph_llm_provider = chosen_gp
+        st.caption(PROVIDER_HELP[chosen_gp])
+
+        if chosen_gp != "none":
+            presets = GRAPH_MODEL_PRESETS[chosen_gp]
+            current_model = (st.session_state.cfg_graph_llm_model or "").strip()
+            if current_model in presets:
+                sel_default = current_model
+            elif current_model:
+                sel_default = "Custom…"
+            else:
+                sel_default = presets[0]
+            g1, g2 = st.columns([3, 2])
+            with g1:
+                chosen_model = st.selectbox(
+                    "Model",
+                    presets,
+                    index=presets.index(sel_default),
+                    key=_wk(f"cfg_graph_llm_model_sel_{chosen_gp}"),
+                )
+            with g2:
+                if chosen_model == "Custom…":
+                    custom_model = st.text_input(
+                        "Custom model ID",
+                        value=current_model if current_model not in presets else "",
+                        key=_wk(f"cfg_graph_llm_model_custom_{chosen_gp}"),
+                        placeholder="provider-specific model name",
+                    )
+                    effective_model = (custom_model or "").strip()
+                else:
+                    effective_model = chosen_model
+            st.session_state.cfg_graph_llm_model = effective_model
+
+            api_key = st.text_input(
+                f"{chosen_gp.title()} API key",
+                value=st.session_state.cfg_graph_llm_api_key,
+                type="password",
+                placeholder="sk-...",
+                help="Stored only in this browser session. Never written to disk.",
+                key=_wk(f"cfg_graph_llm_api_key_{chosen_gp}"),
+            )
+            st.session_state.cfg_graph_llm_api_key = (api_key or "").strip()
+
+            if effective_model and st.session_state.cfg_graph_llm_api_key:
+                st.caption(f"Graph-extraction LLM: **{chosen_gp}:{effective_model}**")
+            else:
+                st.caption("_Pick a model and enter an API key to enable graph extraction._")
+        else:
+            # Reset model/key when provider is none so we don't send stale values through.
+            st.session_state.cfg_graph_llm_model = ""
+            st.session_state.cfg_graph_llm_api_key = ""
 
     # Cache management
     st.markdown("")
