@@ -78,18 +78,18 @@ class Settings(BaseSettings):
     hf_token: str = Field(default="", alias="HF_TOKEN")
 
     # --- Graph-extraction LLM (for Neo4j knowledge-graph building) ---
-    # Entity/relation extraction calls an LLM per chunk — the main answer
-    # LLM is often a small local model too slow for this. A cloud API LLM
-    # is 10–100× faster and runs many chunks in parallel cheaply. "none"
-    # skips extraction entirely (Neo4j stores vector-only flat chunks).
+    # Open-source providers only: extraction runs on the user's own machine
+    # (Ollama server) or via local Transformers (HuggingFace). "none" skips
+    # extraction entirely — but neo4j/both backends require it, so the
+    # pipeline will hard-error on those if provider is none.
     graph_llm_provider: str = Field(
         default="none", alias="GRAPH_LLM_PROVIDER"
-    )  # none | anthropic | openai | gemini | openrouter
+    )  # none | ollama | huggingface
     graph_llm_model: str = Field(default="", alias="GRAPH_LLM_MODEL")
-    graph_llm_api_key: str = Field(default="", alias="GRAPH_LLM_API_KEY")
-    # Parallel chunk workers for extraction. Cloud APIs tolerate 4–8 concurrent
-    # requests; raise carefully to avoid rate limits.
-    graph_llm_workers: int = Field(default=4, alias="GRAPH_LLM_WORKERS")
+    # Parallel chunk workers for extraction. Local providers bottleneck on
+    # the single in-memory model so workers > 1 is mostly pointless; keep
+    # it at 1 unless your Ollama/HF setup genuinely runs concurrent forwards.
+    graph_llm_workers: int = Field(default=1, alias="GRAPH_LLM_WORKERS")
 
     # --- Graph retrieval (neo4j backend uses pure graph traversal) ---
     # Hop depth for entity expansion at query time. 0 = matched entities only;

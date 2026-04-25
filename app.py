@@ -48,6 +48,7 @@ OLLAMA_LLM_PRESETS = [
     "gemma4:e4b",
     "gemma4:e2b",
     "deepseek-r1:8b",
+    "qwen3:0.6b",
     "Custom…",
 ]
 
@@ -87,9 +88,8 @@ _DEFAULT_CFG: dict = {
     # Graph-extraction LLM (only relevant when backend includes Neo4j).
     # "none" = skip entity/relation extraction; Neo4j stores only flat
     # Chunk nodes with embeddings (disconnected graph).
-    "cfg_graph_llm_provider": "none",  # none | anthropic | openai | gemini | openrouter
+    "cfg_graph_llm_provider": "none",  # none | ollama | huggingface
     "cfg_graph_llm_model": "",
-    "cfg_graph_llm_api_key": "",
 }
 
 
@@ -335,8 +335,50 @@ def _server_boot_token() -> str:
 _BOOT_TOKEN = _server_boot_token()
 
 
+def _wipe_persistent_stores() -> None:
+    """Erase Neo4j graph + Chroma vector store on disk.
+
+    Called from `_hard_reset_session` so a fresh app run / explicit reset
+    starts from a clean slate, not stale data from the prior session.
+    Errors are swallowed — resets must always complete even when Neo4j is
+    down or Chroma's persist dir is locked.
+    """
+    from rag_brain.config import load_settings
+    try:
+        s = load_settings()
+    except Exception:
+        return
+
+    # Neo4j: drop every node/relationship if credentials are present.
+    if s.neo4j_password:
+        try:
+            from langchain_neo4j import Neo4jGraph
+            conn = {
+                "url": s.neo4j_uri,
+                "username": s.neo4j_user,
+                "password": s.neo4j_password,
+            }
+            if s.neo4j_database:
+                conn["database"] = s.neo4j_database
+            graph = Neo4jGraph(**conn, refresh_schema=False)
+            graph.query("MATCH (n) DETACH DELETE n")
+        except Exception:
+            pass
+
+    # Chroma: remove the persist dir; rmtree retries on Windows file locks.
+    try:
+        import shutil
+        from pathlib import Path
+        persist = Path(s.chroma_persist_dir)
+        if persist.exists():
+            shutil.rmtree(persist, ignore_errors=True)
+    except Exception:
+        pass
+
+
 def _hard_reset_session() -> None:
-    """Wipe every key in session_state, release resources, clear caches.
+    """Wipe every key in session_state, release resources, clear caches,
+    AND erase the on-disk Neo4j graph + Chroma vector store.
 
     Explicitly re-stamps all cfg_* defaults and bumps _ui_nonce so widgets
     that Streamlit tracks internally (position-based, no key=) are forced to
@@ -349,6 +391,10 @@ def _hard_reset_session() -> None:
             pipe._release_chroma()
         except Exception:
             pass
+    # Drop persistent stores AFTER releasing the chroma client (Windows holds
+    # SQLite handles otherwise) but BEFORE wiping session state (so we can
+    # still read settings cleanly).
+    _wipe_persistent_stores()
     # Preserve and bump the nonce before wiping; widget keys suffixed with
     # this nonce become fresh widget identities for Streamlit.
     next_nonce = int(st.session_state.get("_ui_nonce", 0)) + 1
@@ -423,7 +469,6 @@ def current_config() -> dict:
         "hf_token": (st.session_state.cfg_hf_token or "").strip(),
         "graph_llm_provider": (st.session_state.cfg_graph_llm_provider or "none"),
         "graph_llm_model": (st.session_state.cfg_graph_llm_model or "").strip(),
-        "graph_llm_api_key": (st.session_state.cfg_graph_llm_api_key or "").strip(),
     }
 
 
@@ -459,8 +504,6 @@ def _pipe_matches_ui(pipe: RAGPipeline, c: dict) -> bool:
     if (s.graph_llm_provider or "none").lower() != (c.get("graph_llm_provider") or "none").lower():
         return False
     if (s.graph_llm_model or "") != (c.get("graph_llm_model") or ""):
-        return False
-    if (s.graph_llm_api_key or "") != (c.get("graph_llm_api_key") or ""):
         return False
     return True
 
@@ -559,7 +602,6 @@ def build_pipeline() -> RAGPipeline:
         "hf_token": c.get("hf_token") or "",
         "graph_llm_provider": (c.get("graph_llm_provider") or "none"),
         "graph_llm_model": c.get("graph_llm_model") or "",
-        "graph_llm_api_key": c.get("graph_llm_api_key") or "",
     })
     settings = Settings(**data)
     return RAGPipeline(settings)
@@ -1171,45 +1213,22 @@ def step_models() -> None:
         st.markdown("### Graph-extraction LLM")
         st.markdown(
             '<span class="muted">Neo4j\'s knowledge graph is built by calling an LLM on every chunk '
-            'to extract entities and relationships. A fast cloud API (Anthropic/OpenAI/Gemini) '
-            'is strongly recommended — local models take minutes per document.</span>',
+            'to extract entities and relationships. Open-source providers only — runs locally on your '
+            'machine. Local extraction is meaningfully slower than cloud APIs; budget minutes per '
+            'document and keep <code>GRAPH_LLM_WORKERS=1</code>.</span>',
             unsafe_allow_html=True,
         )
 
-        GRAPH_PROVIDERS = ["none", "anthropic", "openai", "gemini", "openrouter"]
+        GRAPH_PROVIDERS = ["none", "ollama", "huggingface"]
+        # Reuse the answer-LLM presets — same model catalogs, same install path.
         GRAPH_MODEL_PRESETS: dict[str, list[str]] = {
-            "anthropic": [
-                "claude-haiku-4-5-20251001",
-                "claude-sonnet-4-6",
-                "claude-opus-4-7",
-                "Custom…",
-            ],
-            "openai": [
-                "gpt-4o-mini",
-                "gpt-4o",
-                "gpt-4.1-mini",
-                "Custom…",
-            ],
-            "gemini": [
-                "gemini-2.0-flash",
-                "gemini-2.5-flash",
-                "gemini-2.5-pro",
-                "Custom…",
-            ],
-            "openrouter": [
-                "anthropic/claude-haiku-4-5",
-                "openai/gpt-4o-mini",
-                "google/gemini-2.0-flash",
-                "meta-llama/llama-3.3-70b-instruct",
-                "Custom…",
-            ],
+            "ollama": OLLAMA_LLM_PRESETS,
+            "huggingface": HF_LLM_PRESETS,
         }
         PROVIDER_HELP = {
-            "none": "Skip extraction. Neo4j stores only flat :Chunk nodes (disconnected graph, vector search still works).",
-            "anthropic": "Claude API. Get a key at console.anthropic.com.",
-            "openai": "OpenAI API. Get a key at platform.openai.com.",
-            "gemini": "Google AI Studio. Get a key at aistudio.google.com/apikey.",
-            "openrouter": "Unified API for many providers. Get a key at openrouter.ai.",
+            "none": "Skip extraction. Required for vector backend; neo4j/both backends will fail to ingest.",
+            "ollama": "Local Ollama server. Pull the model first with `ollama pull <name>`.",
+            "huggingface": "Local Transformers pipeline. Downloads on first use; gated models reuse the HF token from above.",
         }
 
         gp_current = st.session_state.cfg_graph_llm_provider or "none"
@@ -1256,24 +1275,13 @@ def step_models() -> None:
                     effective_model = chosen_model
             st.session_state.cfg_graph_llm_model = effective_model
 
-            api_key = st.text_input(
-                f"{chosen_gp.title()} API key",
-                value=st.session_state.cfg_graph_llm_api_key,
-                type="password",
-                placeholder="sk-...",
-                help="Stored only in this browser session. Never written to disk.",
-                key=_wk(f"cfg_graph_llm_api_key_{chosen_gp}"),
-            )
-            st.session_state.cfg_graph_llm_api_key = (api_key or "").strip()
-
-            if effective_model and st.session_state.cfg_graph_llm_api_key:
+            if effective_model:
                 st.caption(f"Graph-extraction LLM: **{chosen_gp}:{effective_model}**")
             else:
-                st.caption("_Pick a model and enter an API key to enable graph extraction._")
+                st.caption("_Pick a model to enable graph extraction._")
         else:
-            # Reset model/key when provider is none so we don't send stale values through.
+            # Reset model when provider is none so we don't send stale values through.
             st.session_state.cfg_graph_llm_model = ""
-            st.session_state.cfg_graph_llm_api_key = ""
 
     # Cache management
     st.markdown("")
@@ -1501,6 +1509,26 @@ def step_chat() -> None:
                     _render_assistant_message(out["answer"], mode=mode, top_score=top_score)
                     retrieved = out.get("retrieved", [])
                     _render_retrieved(retrieved)
+                    # Graph-backend diagnostics — show the user what the
+                    # graph LLM extracted from their question. Silent
+                    # entity-extraction failures are the #1 footgun for
+                    # neo4j-backend retrieval; this makes them obvious.
+                    if out.get("graph_backend_used"):
+                        extracted = out.get("extracted_entities") or []
+                        if extracted:
+                            shown = ", ".join(repr(e) for e in extracted)
+                            st.caption(f"🔍 Graph entities extracted: {shown}")
+                        elif mode == "chat":
+                            banner(
+                                "warning",
+                                "Graph LLM extracted <b>no entities</b> from your question. "
+                                "Either qwen3 is not running, returned empty, or its output couldn't be parsed. "
+                                "Check the warning(s) below for the raw LLM output.",
+                            )
+                    # Surface retrieval-side warnings (LLM call failures,
+                    # parse errors, empty extractions) verbatim.
+                    for w in getattr(pipe, "last_query_warnings", []) or []:
+                        banner("warning", w)
                     st.session_state.chat_history.append(
                         {
                             "role": "assistant",

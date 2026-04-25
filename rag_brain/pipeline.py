@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import shutil
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,8 @@ from langchain_ollama import ChatOllama
 from rag_brain.config import RetrievalBackend, Settings, load_settings
 from rag_brain.embeddings import get_embeddings
 from rag_brain.ingestion import load_documents, split_documents
+
+log = logging.getLogger("rag_brain.pipeline")
 
 
 def _rmtree_windows_safe(path: Path) -> None:
@@ -66,40 +69,51 @@ def _deduplicate_docs(docs: list[Document]) -> list[Document]:
 _HF_MAX_NEW_TOKENS = 512
 
 
-def _build_hf_llm(settings: Settings):
-    """Build a HuggingFace transformers pipeline wrapped as a chat model for LangChain."""
+def _build_hf_chat(*, model_name: str, hf_token: str = "", temperature: float = 0.1):
+    """Build a HuggingFace transformers chat model.
+
+    Shared by the answer LLM and the graph-extraction LLM — they pick
+    different models and temperatures but the loading path is identical.
+    """
     import os
     import torch
     from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
-    from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+    from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline as hf_pipeline
 
     # Mirror the token into HF_TOKEN / HUGGINGFACE_HUB_TOKEN so any HF
     # utility (sentence-transformers, hub downloads) invoked in this
     # process also authenticates — not just the explicit token= kwargs below.
-    if settings.hf_token:
-        os.environ["HF_TOKEN"] = settings.hf_token
-        os.environ["HUGGINGFACE_HUB_TOKEN"] = settings.hf_token
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+        os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
 
     model_kwargs: dict[str, Any] = {
         "device_map": "auto",
         "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
     }
+    token = hf_token or None
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
+    model = AutoModelForCausalLM.from_pretrained(model_name, token=token, **model_kwargs)
 
-    token = settings.hf_token or None
-    tokenizer = AutoTokenizer.from_pretrained(settings.hf_model, token=token)
-    model = AutoModelForCausalLM.from_pretrained(settings.hf_model, token=token, **model_kwargs)
-
-    pipe = pipeline(
+    pipe = hf_pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
         max_new_tokens=_HF_MAX_NEW_TOKENS,
-        temperature=0.1,
-        do_sample=True,
+        temperature=temperature,
+        do_sample=temperature > 0,
         return_full_text=False,
     )
     llm = HuggingFacePipeline(pipeline=pipe)
     return ChatHuggingFace(llm=llm)
+
+
+def _build_hf_llm(settings: Settings):
+    return _build_hf_chat(
+        model_name=settings.hf_model,
+        hf_token=settings.hf_token,
+        temperature=0.1,
+    )
 
 
 def _build_llm(settings: Settings):
@@ -152,6 +166,12 @@ _RERANK_CANDIDATE_POOL = 20
 # wiped in _ensure_chroma — user just re-ingests.
 _CHROMA_COLLECTION_META = {"hnsw:space": "cosine"}
 
+# Cosine similarity threshold for embedding-based entity merging.
+# 0.92 is conservative — catches near-paraphrases ("Apple" ≈ "Apple Inc.")
+# without false-merging weakly related concepts. Tighten if you see bad
+# merges in the logs; loosen if too many obvious aliases stay separate.
+_ENTITY_MERGE_COSINE_THRESHOLD = 0.92
+
 
 def _sigmoid(x: float) -> float:
     """Safe scalar sigmoid (avoids overflow on large negatives)."""
@@ -169,12 +189,19 @@ def _normalize_chroma_distance(dist: float) -> float:
 
 
 _QUERY_ENTITY_PROMPT = (
-    "You extract entity mentions for a knowledge-graph search. "
-    "Given the user's question, return a JSON array of strings: the named "
-    "entities, proper nouns, and concrete concepts likely to appear as "
-    "nodes in a knowledge graph. Lowercase common words and stopwords are "
-    "useless — skip them. Return ONLY the JSON array, no prose, no "
-    "markdown fencing. If no entities, return []."
+    "You extract entity mentions for a knowledge-graph search. Given the "
+    "user's question, identify named entities, proper nouns, and concrete "
+    "concepts likely to appear as graph nodes. Skip stopwords and common "
+    "words.\n\n"
+    "Respond with a JSON array of strings on a single line. Nothing else — "
+    "no prose, no markdown fencing, no explanations, no thinking out loud.\n\n"
+    "Examples:\n"
+    'Q: who founded Acme Corp?\n'
+    'A: ["Acme Corp"]\n\n'
+    'Q: what did Alice say about Bob\'s project?\n'
+    'A: ["Alice", "Bob"]\n\n'
+    "Q: how does it work?\n"
+    "A: []"
 )
 
 
@@ -384,43 +411,60 @@ class RAGPipeline:
             detail = "; ".join(warnings) if warnings else "no graph documents produced"
             raise RuntimeError(f"Graph extraction failed: {detail}")
 
+        # Post-extraction graph hygiene. Both are best-effort — a failure
+        # here doesn't undo a successful chunk extraction.
+        try:
+            self._link_chunks_to_files()
+        except Exception as e:
+            log.warning("file-hierarchy: skipped due to error: %s", e)
+            if hasattr(self, "last_ingest_warnings"):
+                self.last_ingest_warnings.append(f"File-hierarchy step skipped: {e}")
+        try:
+            self._merge_similar_entities()
+        except Exception as e:
+            log.warning("entity-merge: skipped due to error: %s", e)
+            if hasattr(self, "last_ingest_warnings"):
+                self.last_ingest_warnings.append(f"Entity-merge step skipped: {e}")
+
     def _build_graph_llm(self):
         """Build the LLM used for knowledge-graph extraction.
 
-        Keeps extraction decoupled from the answer LLM: resumes and papers
-        tend to need a strong, fast model for relation extraction (cloud
-        APIs), while the answer LLM can still be a small local model.
+        Open-source providers only:
+          - ollama:      local Ollama server (any model pulled with `ollama pull`).
+                         Single in-memory model, so workers > 1 doesn't actually
+                         parallelize — Ollama queues concurrent calls.
+          - huggingface: local Transformers pipeline. Same single-model bottleneck;
+                         needs HF token for gated repos (Llama, Gemma, Mistral).
 
-        Returns None if provider is 'none' or config is incomplete.
+        Local extraction is meaningfully slower than cloud APIs (per-chunk
+        forward pass on one GPU/CPU) — budget minutes-to-hours for thesis
+        corpora, not seconds. Recommend `GRAPH_LLM_WORKERS=1`.
+
+        Returns None if provider is 'none' or model is missing.
         """
         s = self.settings
         provider = (s.graph_llm_provider or "none").lower()
         if provider == "none":
             return None
         model = (s.graph_llm_model or "").strip()
-        key = (s.graph_llm_api_key or "").strip()
-        if not model or not key:
+        if not model:
             return None
 
-        if provider == "anthropic":
-            from langchain_anthropic import ChatAnthropic
-            return ChatAnthropic(model=model, api_key=key, temperature=0)
-        if provider == "openai":
-            from langchain_openai import ChatOpenAI
-            return ChatOpenAI(model=model, api_key=key, temperature=0)
-        if provider == "gemini":
-            from langchain_google_genai import ChatGoogleGenerativeAI
-            return ChatGoogleGenerativeAI(model=model, google_api_key=key, temperature=0)
-        if provider == "openrouter":
-            # OpenRouter exposes an OpenAI-compatible API.
-            from langchain_openai import ChatOpenAI
-            return ChatOpenAI(
+        if provider == "ollama":
+            return ChatOllama(
+                base_url=s.ollama_base_url,
                 model=model,
-                api_key=key,
-                base_url="https://openrouter.ai/api/v1",
                 temperature=0,
             )
-        raise ValueError(f"Unknown graph_llm_provider: {provider!r}")
+        if provider == "huggingface":
+            return _build_hf_chat(
+                model_name=model,
+                hf_token=s.hf_token,
+                temperature=0,
+            )
+        raise ValueError(
+            f"Unknown graph_llm_provider: {provider!r}. Use one of: none, ollama, huggingface."
+        )
 
     def _extract_graph(self, chunks: list[Document]) -> int:
         """Run LLMGraphTransformer over chunks → entities + relationships.
@@ -470,6 +514,7 @@ class RAGPipeline:
         workers = max(1, int(self.settings.graph_llm_workers or 4))
         graph_docs = []
         errors: list[str] = []
+        log.info("graph-extract: starting %d chunks (workers=%d)", len(chunks), workers)
 
         def _run_one(doc):
             return transformer.process_response(doc)
@@ -481,6 +526,10 @@ class RAGPipeline:
                     graph_docs.append(fut.result())
                 except Exception as e:
                     errors.append(str(e))
+        log.info(
+            "graph-extract: %d/%d chunks produced GraphDocuments (%d errors)",
+            len(graph_docs), len(chunks), len(errors),
+        )
 
         if errors and hasattr(self, "last_ingest_warnings"):
             self.last_ingest_warnings.append(
@@ -498,6 +547,168 @@ class RAGPipeline:
             include_source=True,
         )
         return len(graph_docs)
+
+    # ── Post-extraction graph hygiene ──────────────────────────────────
+
+    def _link_chunks_to_files(self) -> int:
+        """Group `:Document` chunks under a `:File` parent node.
+
+        Each :Document keeps its `source` property (filename); we MERGE one
+        :File node per unique source and link via `[:HAS_CHUNK]`. Idempotent —
+        re-runs on the same data don't duplicate nodes or edges.
+
+        This gives the graph a clean two-level hierarchy
+        (File → Document → __Entity__) so the visualization matches user
+        intuition ("I uploaded 2 PDFs, I expect 2 file-level clusters").
+        """
+        if self._neo4j_graph is None:
+            return 0
+        rows = self._neo4j_graph.query(
+            """
+            MATCH (d:Document)
+            WHERE d.source IS NOT NULL
+            MERGE (f:File {name: d.source})
+            MERGE (f)-[:HAS_CHUNK]->(d)
+            RETURN count(d) AS linked
+            """
+        )
+        linked = int(rows[0].get("linked", 0)) if rows else 0
+        log.info("file-hierarchy: linked %d Document(s) under :File parents", linked)
+        return linked
+
+    def _merge_similar_entities(self) -> int:
+        """Cluster `:__Entity__` nodes by ID similarity and merge them.
+
+        The biggest weakness of LLMGraphTransformer is per-chunk entity-name
+        drift — "Gitesh", "Gitesh Chawda", "G. Chawda" stay as 3 separate
+        nodes because LangChain's MERGE is exact-string. This step fixes
+        that by clustering similar entity IDs and merging each cluster
+        into a single canonical node (the longest, most informative ID).
+
+        Two entities cluster together if EITHER:
+          - One's *words* are a subset of the other's (catches
+            "Gitesh" ⊂ "Gitesh Chawda" but NOT "Java" ⊂ "JavaScript"
+            since we match whole words, not substrings)
+          - Their normalized embeddings have cosine similarity ≥ 0.92
+            (catches paraphrases the substring rule misses)
+
+        Uses `apoc.refactor.mergeNodes` for the actual merge — same APOC
+        already required by `add_graph_documents`. Returns the number of
+        nodes that were merged into canonical ones.
+        """
+        import re as _re
+
+        if self._neo4j_graph is None:
+            return 0
+        rows = self._neo4j_graph.query(
+            "MATCH (e:__Entity__) WHERE e.id IS NOT NULL RETURN DISTINCT e.id AS id"
+        )
+        ids = [r["id"] for r in rows if r.get("id")]
+        if len(ids) < 2:
+            return 0
+
+        log.info("entity-merge: scanning %d entities", len(ids))
+
+        # Embed all IDs in one batch; cheap on CPU at this scale.
+        embeddings = self._embeddings.embed_documents(ids)
+        import numpy as np
+        arr = np.array(embeddings, dtype=np.float32)
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        arr = arr / norms
+        sim = arr @ arr.T
+
+        # Union-Find for clustering.
+        n = len(ids)
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        # Pre-compute word sets for the substring rule. \w matches across
+        # alnum + underscore which is what we want; punctuation is ignored.
+        word_sets = [set(_re.findall(r"\w+", i.lower())) for i in ids]
+        lower_ids = [i.lower() for i in ids]
+
+        def _is_url(s_lower: str) -> bool:
+            return s_lower.startswith(("http://", "https://")) or "://" in s_lower
+
+        def _word_subset_safe(a: int, b: int) -> bool:
+            """Conservative word-subset rule with three guards against the
+            false merges we saw in practice (URLs, form-field labels, and
+            wildly different specificity)."""
+            wa, wb = word_sets[a], word_sets[b]
+            if not (wa and wb):
+                return False
+            if not (wa <= wb or wb <= wa):
+                return False
+            # URL guard — "Fbi" must NOT merge into "https://www.fbi.gov/...".
+            # Treat URLs as unique atoms.
+            if _is_url(lower_ids[a]) != _is_url(lower_ids[b]):
+                return False
+            # Form-field guard — "Sex" vs "Sex: (Check One)" are a real entity
+            # and a form-field label. Don't collapse.
+            if (":" in ids[a]) != (":" in ids[b]):
+                return False
+            # Specificity guard — "Date" vs "Date Of Birth (Mm/Dd/Yy)" share
+            # a word but mean different things. Only merge when the longer
+            # side adds at most ~one extra word per shorter-side word.
+            longer = max(len(wa), len(wb))
+            shorter = min(len(wa), len(wb))
+            if longer > 2 * shorter + 1:
+                return False
+            return True
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if _word_subset_safe(i, j) or sim[i, j] >= _ENTITY_MERGE_COSINE_THRESHOLD:
+                    union(i, j)
+
+        clusters: dict[int, list[int]] = {}
+        for i in range(n):
+            clusters.setdefault(find(i), []).append(i)
+
+        merge_count = 0
+        for members in clusters.values():
+            if len(members) < 2:
+                continue
+            # Canonical = longest ID (most descriptive); tie-break alphabetical
+            # so the choice is deterministic across runs.
+            canonical_idx = max(members, key=lambda k: (len(ids[k]), ids[k]))
+            canonical_id = ids[canonical_idx]
+            for k in members:
+                if k == canonical_idx:
+                    continue
+                alias_id = ids[k]
+                try:
+                    self._neo4j_graph.query(
+                        """
+                        MATCH (canonical:__Entity__ {id: $canonical})
+                        MATCH (alias:__Entity__ {id: $alias})
+                        WHERE canonical <> alias
+                        CALL apoc.refactor.mergeNodes(
+                            [canonical, alias],
+                            {mergeRels: true, properties: 'discard'}
+                        )
+                        YIELD node RETURN node
+                        """,
+                        params={"canonical": canonical_id, "alias": alias_id},
+                    )
+                    merge_count += 1
+                    log.info("entity-merge: %r → %r", alias_id, canonical_id)
+                except Exception as e:
+                    log.warning("entity-merge: failed %r → %r: %s", alias_id, canonical_id, e)
+
+        log.info("entity-merge: %d node(s) merged into canonicals", merge_count)
+        return merge_count
 
     # ── Loading existing stores ────────────────────────────────────────
 
@@ -562,45 +773,116 @@ class RAGPipeline:
     def _extract_query_entities(self, question: str) -> list[str]:
         """Ask the graph LLM for a JSON list of entity mentions in `question`.
 
-        Returns [] if the LLM is unavailable or its output can't be parsed —
-        callers treat that as 'no graph hits' and fall through to chat mode
-        (or, in `both` backend, vector results carry the query).
+        Returns [] if the LLM is unavailable or output can't be parsed.
+        Failures are appended to `last_query_warnings` so the UI can surface
+        them — silent empties are the worst footgun for thesis demos.
+
+        Robustness for local models:
+          - strips <think>...</think> blocks (qwen3, deepseek-r1 emit these)
+          - strips ```json ...``` markdown fences
+          - falls back to the LAST [...] block if the model wraps in prose
         """
         import json as _json
         import re as _re
 
         llm = self._ensure_graph_query_llm()
         if llm is None:
+            log.warning("entity-extract: no graph LLM configured; returning []")
             return []
         prompt = ChatPromptTemplate.from_messages(
             [("system", _QUERY_ENTITY_PROMPT), ("human", "{question}")]
         )
+        log.info("entity-extract: question=%r", question)
         try:
             raw = (prompt | llm | StrOutputParser()).invoke({"question": question})
-        except Exception:
+        except Exception as e:
+            log.warning("entity-extract: LLM call failed: %s", e)
+            if hasattr(self, "last_query_warnings"):
+                self.last_query_warnings.append(f"Entity extraction LLM call failed: {e}")
             return []
+        log.debug("entity-extract: raw output (first 400 chars): %r", (raw or "")[:400])
+
         text = (raw or "").strip()
-        # Strip ```json ... ``` fences if the model added them.
+        # 1. Strip reasoning blocks. qwen3/deepseek-r1 etc. emit these by
+        # default; the JSON we want comes after.
+        text = _re.sub(r"<think>.*?</think>", "", text, flags=_re.DOTALL).strip()
+        # 2. Strip ```json ... ``` markdown fences.
         if text.startswith("```"):
             text = _re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=_re.MULTILINE).strip()
-        # Try strict JSON first; fall back to first [...] block.
-        items: list = []
+        # 3. Coerce Python-set syntax `{"a", "b"}` → JSON array `["a", "b"]`.
+        # Small local models like qwen3 occasionally emit set literals where
+        # we asked for a list; both convey the same data.
+        def _coerce_sets(s: str) -> str:
+            def repl(m: _re.Match) -> str:
+                inner = m.group(1)
+                # If it looks like a real JSON object (has `"key":` pattern),
+                # leave it alone — only convert when it's clearly a set.
+                if _re.search(r'"\s*:\s*', inner):
+                    return m.group(0)
+                return "[" + inner + "]"
+            prev = None
+            while s != prev:
+                prev = s
+                s = _re.sub(r"\{([^{}]*)\}", repl, s)
+            return s
+        text = _coerce_sets(text)
+
+        items: list | None = None
+        # 4. Try strict JSON first.
         try:
-            items = _json.loads(text)
+            parsed = _json.loads(text)
+            if isinstance(parsed, list):
+                items = parsed
         except Exception:
-            m = _re.search(r"\[.*?\]", text, flags=_re.DOTALL)
-            if m:
+            pass
+        # 5. Fall back to the LAST [...] block in the text — useful when the
+        # model narrates before/after the JSON. We try last-first because
+        # any inline example list would appear earlier.
+        if items is None:
+            for block in reversed(_re.findall(r"\[[^\[\]]*\]", text, flags=_re.DOTALL)):
                 try:
-                    items = _json.loads(m.group(0))
+                    parsed = _json.loads(block)
+                    if isinstance(parsed, list):
+                        items = parsed
+                        break
                 except Exception:
-                    items = []
-        if not isinstance(items, list):
+                    continue
+
+        if items is None:
+            preview = (raw or "")[:200].replace("\n", " ")
+            log.warning("entity-extract: unparseable output: %r", preview)
+            if hasattr(self, "last_query_warnings"):
+                self.last_query_warnings.append(
+                    f"Entity extractor returned unparseable output: {preview!r}"
+                )
             return []
+
+        # Flatten arbitrary nesting. Models occasionally emit
+        # `[["Alice", "Bob"]]` (list-of-lists) or mix scalars with sub-lists;
+        # collect every leaf string and discard structure.
         out: list[str] = []
-        for it in items:
-            s = str(it).strip()
-            if s:
-                out.append(s)
+        def _collect(x):
+            if isinstance(x, list):
+                for y in x:
+                    _collect(y)
+            elif x is not None:
+                s = str(x).strip()
+                if s:
+                    out.append(s)
+        _collect(items)
+
+        # An empty (but valid) extraction is just as fatal as a parse failure
+        # for graph retrieval — surface it so the user can see the LLM ran but
+        # found nothing.
+        if not out:
+            preview = (raw or "")[:120].replace("\n", " ")
+            log.warning("entity-extract: 0 entities; raw=%r", preview)
+            if hasattr(self, "last_query_warnings"):
+                self.last_query_warnings.append(
+                    f"Graph LLM extracted 0 entities from the question. Raw output: {preview!r}"
+                )
+        else:
+            log.info("entity-extract: %d entities: %r", len(out), out)
         return out
 
     def _graph_retrieve(self, question: str, pool: int) -> list[Document]:
@@ -616,6 +898,10 @@ class RAGPipeline:
         intended tradeoff for this backend.
         """
         terms = self._extract_query_entities(question)
+        # Snapshot the entities for the query-time diagnostic surface (UI
+        # shows "what did the graph LLM extract?" so silent failures aren't
+        # mysterious).
+        self.last_extracted_entities = list(terms)
         if not terms:
             return []
 
@@ -643,12 +929,17 @@ class RAGPipeline:
                         coalesce(d.source, '?') AS source
         LIMIT $pool
         """
+        log.info(
+            "graph-retrieve: cypher seeds=%r hops=%d max_entities=%d pool=%d",
+            terms, hops, max_entities, pool,
+        )
         try:
             rows = graph.query(
                 cypher,
                 params={"terms": terms, "max_entities": max_entities, "pool": pool},
             )
-        except Exception:
+        except Exception as e:
+            log.warning("graph-retrieve: Cypher failed: %s", e)
             return []
         out: list[Document] = []
         for r in rows:
@@ -656,6 +947,7 @@ class RAGPipeline:
             if not text:
                 continue
             out.append(Document(page_content=text, metadata={"source": r.get("source") or "?"}))
+        log.info("graph-retrieve: %d row(s) → %d Document(s)", len(rows), len(out))
         return out
 
     # ── Retrieval ──────────────────────────────────────────────────────
@@ -787,10 +1079,16 @@ class RAGPipeline:
         - top_score <  _RERANK_SCORE_THRESHOLD → chat mode (answer from
           general knowledge, no citations, no doc context passed to LLM)
         """
+        # Reset per-query diagnostics so the UI never shows stale info.
+        self.last_extracted_entities: list[str] = []
         scored = self._retrieve_scored(question)
         top_score = scored[0][1] if scored else 0.0
         docs = [d for d, _ in scored]
         use_rag = bool(docs) and top_score >= _RERANK_SCORE_THRESHOLD
+        log.info(
+            "query: q=%r → mode=%s top_score=%.3f docs=%d",
+            question, "rag" if use_rag else "chat", top_score, len(docs),
+        )
 
         if use_rag:
             prompt = ChatPromptTemplate.from_messages(
@@ -822,6 +1120,8 @@ class RAGPipeline:
             "mode": mode,
             "top_score": top_score,
             "reranker_used": self._reranker is not None,
+            "extracted_entities": list(getattr(self, "last_extracted_entities", []) or []),
+            "graph_backend_used": self._use_neo4j,
             "retrieved": [
                 {"content": d.page_content, "metadata": dict(d.metadata or {})}
                 for d in retrieved_docs

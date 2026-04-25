@@ -31,8 +31,3 @@ bert-score>=0.3.13
 
 # UI
 streamlit>=1.30.0
-
-# Graph-extraction LLM providers (optional — install the ones you use)
-langchain-anthropic>=0.3.0
-langchain-openai>=0.3.0
-langchain-google-genai>=2.0.0
